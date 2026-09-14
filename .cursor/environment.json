@@ -1,0 +1,4 @@
+{
+  "name": "AKernel Python SDK",
+  "install": "bash .cursor/install.sh"
+}
