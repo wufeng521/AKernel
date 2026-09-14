@@ -23,19 +23,6 @@ cd "$repo_root"
 
 python3 -m pip install --upgrade pip
 
-# Preferred path: install exactly as pinned by sdk/python/pyproject.toml.
-if python3 -m pip install -e './sdk/python[dev]'; then
-    exit 0
-fi
-
-# Fallback: the openyuanrong-sdk release pinned by pyproject.toml is not always
-# present on PyPI. Install the closest compatible 0.9.x runtime plus the dev
-# tooling, then install the SDK itself without re-resolving the unavailable pin.
-echo "Pinned install failed; falling back to a compatible openyuanrong-sdk." >&2
-python3 -m pip install \
-    'openyuanrong-sdk==0.9.2' \
-    'websockets>=10.0' \
-    'build>=1.2,<2' \
-    'mypy>=1.10,<2' \
-    'ruff>=0.11,<1'
-python3 -m pip install --no-deps -e './sdk/python'
+# Install the SDK exactly as pinned by sdk/python/pyproject.toml, including the
+# dev extra (ruff, mypy, build, and the openyuanrong-sdk pin used by tests).
+python3 -m pip install -e './sdk/python[dev]'
