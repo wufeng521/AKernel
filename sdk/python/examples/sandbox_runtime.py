@@ -14,9 +14,14 @@
 
 """Select a sandbox runtime.
 
-The Kata case requires at least one cluster node that advertises Kata support.
-Otherwise, the scheduler returns a no-resource error.
+The Kata and Firecracker cases require at least one cluster node that
+advertises the respective KVM-backed runtime. The Firecracker case uses the
+deployment's default EROFS root; OCI/Nydus directory images are not supported
+by that runtime.
+Set AKERNEL_EXAMPLE_RUNC=true to include the optional runc runtime.
 """
+
+import os
 
 from akernel_sdk import Sandbox
 
@@ -25,7 +30,11 @@ def run(runtime: str | None) -> None:
     sandbox = (
         Sandbox(cpu=1000, memory=2048)
         if runtime is None
-        else Sandbox(runtime=runtime, cpu=1000, memory=2048)
+        else Sandbox(
+            runtime=runtime,
+            cpu=1000,
+            memory=2048,
+        )
     )
     with sandbox:
         result = sandbox.commands.run("uname -s")
@@ -37,6 +46,9 @@ def main() -> None:
     run(None)
     run("runsc")
     run("kata")
+    run("firecracker")
+    if os.environ.get("AKERNEL_EXAMPLE_RUNC", "").lower() == "true":
+        run("runc")
 
 
 if __name__ == "__main__":

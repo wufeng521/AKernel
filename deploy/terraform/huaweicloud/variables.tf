@@ -365,8 +365,14 @@ variable "extra_node_pools" {
 
 variable "sandboxd_nat_backend" {
   type        = string
-  description = "Sandboxd NAT backend. When set to 'iptables', ip_tables kernel module will be loaded at boot."
+  description = "Sandboxd NAT backend. The iptables mode loads IPv4/IPv6 bridge-netfilter modules at boot."
   default     = "iptables"
+}
+
+variable "enable_runc" {
+  type        = bool
+  description = "Request the optional runc runtime; the selected node image must be built with AKERNEL_ENABLE_RUNC=true."
+  default     = false
 }
 
 variable "node_home_use_csi_ephemeral" {

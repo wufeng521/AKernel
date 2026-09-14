@@ -12,41 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from akernel_sdk import HttpReverseTunnel, S3Config, Sandbox
+from akernel_sdk import (
+    DNSPolicy,
+    DNSRule,
+    DockerfileLaunch,
+    HttpReverseTunnel,
+    NetworkPolicy,
+    NetworkRule,
+    PortRange,
+    S3Config,
+    Sandbox,
+    TrafficPolicy,
+)
 from akernel_sdk import sandbox as sandbox_module
+from akernel_sdk._dockercontext import LocalDockerContext
+from akernel_sdk._dockerfile import DockerfileBuildError, DockerfileParseError
+from akernel_sdk._dockerfile_runner import DockerfileApplyResult
+from akernel_sdk.types import SandboxInfo
 
 
 class SandboxTest(unittest.TestCase):
     def setUp(self):
-        self.handle = SimpleNamespace(instance_id="logical-id")
-        self.client = MagicMock()
-        backend = sandbox_module._openyuanrong
-        self.patchers = [
-            patch.object(backend, "ensure_initialized"),
-            patch.object(backend, "build_options", return_value="options"),
-            patch.object(backend, "create_instance", return_value=self.handle),
-            patch.object(backend, "real_instance_id", return_value="physical-id"),
-            patch.object(backend, "terminate_instance"),
-            patch.object(backend, "delete_named_instance"),
-            patch.object(backend, "ping_instance", return_value=True),
-            patch.object(backend, "instance_state", return_value="running"),
-            patch.object(backend, "start_reverse_tunnel", return_value=self.client),
-        ]
-        self.mocks = [patcher.start() for patcher in self.patchers]
-        self.addCleanup(self._stop_patchers)
-
-    def _stop_patchers(self):
-        for patcher in reversed(self.patchers):
-            patcher.stop()
-
-    @property
-    def backend(self):
-        return sandbox_module._openyuanrong
+        self.session = MagicMock()
+        self.session.id = "physical-id"
+        self.session.commands = MagicMock()
+        self.session.files = MagicMock()
+        self.session.is_running.return_value = True
+        self.session.get_info.return_value = SandboxInfo(
+            id="physical-id",
+            state="running",
+            cpu=2000,
+            memory=8192,
+            image=None,
+        )
+        self.backend = MagicMock()
+        self.backend.create.return_value = self.session
+        self.load_backend = patch.object(
+            sandbox_module,
+            "load_backend",
+            return_value=self.backend,
+        )
+        self.load_backend.start()
+        self.addCleanup(self.load_backend.stop)
 
     def test_default_constructor_and_info(self):
         sandbox = Sandbox(cpu=2000, memory=8192)
@@ -57,24 +69,187 @@ class SandboxTest(unittest.TestCase):
         self.assertEqual(sandbox.get_info().cpu, 2000)
         self.assertIsNone(sandbox.get_info().xpu)
         self.assertIsNone(sandbox.get_info().storage_mb)
-        self.backend.build_options.assert_called_once()
+        self.assertIsNone(sandbox.startup_command)
+
+        spec = self.backend.create.call_args.args[0]
+        self.assertEqual(spec.cpu, 2000)
+        self.assertEqual(spec.memory, 8192)
+        self.assertEqual(dict(spec.env), {})
+        self.assertIsNone(spec.xpu)
+        self.assertIsNone(spec.storage_mb)
+        self.assertFalse(spec.failover)
+        self.assertFalse(spec.inherit_entrypoint)
+        self.assertIsNone(spec.network_policy)
+        self.assertEqual(dict(spec.extra_config), {})
         sandbox.kill()
-        self.backend.terminate_instance.assert_called_once_with(self.handle)
+        self.session.terminate.assert_called_once_with()
+        self.session.close.assert_called_once_with()
+
+    def test_extra_config_is_validated_and_defensively_copied(self):
+        labels = ["worker"]
+        requested = {"featureFlag": True, "nested": {"labels": labels}}
+
+        sandbox = Sandbox(extra_config=requested)
+        spec = self.backend.create.call_args.args[0]
+        requested["featureFlag"] = False
+        labels.append("mutated")
+
+        self.assertEqual(
+            dict(spec.extra_config),
+            {"featureFlag": True, "nested": {"labels": ["worker"]}},
+        )
+        sandbox.kill()
+
+    def test_extra_config_rejects_non_json_values(self):
+        invalid = (
+            (["not", "a", "mapping"], TypeError),
+            ({1: "non-string key"}, TypeError),
+            ({"value": object()}, TypeError),
+            ({"value": float("inf")}, ValueError),
+        )
+        circular: dict[str, object] = {}
+        circular["self"] = circular
+        invalid += ((circular, ValueError),)
+
+        for value, error_type in invalid:
+            with self.subTest(value=value), self.assertRaises(error_type):
+                Sandbox(extra_config=value)
+        self.backend.create.assert_not_called()
 
     def test_kill_is_idempotent(self):
         sandbox = Sandbox()
         sandbox.kill()
         sandbox.kill()
-        self.backend.terminate_instance.assert_called_once_with(self.handle)
+        self.session.terminate.assert_called_once_with()
+        self.session.close.assert_called_once_with()
 
     def test_detached_sandbox_is_not_terminated_by_kill(self):
         sandbox = Sandbox(name="worker", detached=True)
         sandbox.kill()
-        self.backend.terminate_instance.assert_not_called()
+        self.session.terminate.assert_not_called()
+        self.session.close.assert_called_once_with()
+
+    def test_termination_failure_still_closes_local_resources(self):
+        remote_error = RuntimeError("remote delete failed")
+        self.session.terminate.side_effect = [remote_error, None]
+        sandbox = Sandbox()
+        pty = MagicMock()
+        sandbox._pty = pty
+
+        with self.assertRaisesRegex(RuntimeError, "remote delete failed") as raised:
+            sandbox.kill()
+
+        self.assertIs(raised.exception, remote_error)
+        pty._close.assert_called_once_with()
+        self.session.close.assert_called_once_with()
+
+        sandbox.kill()
+        sandbox.kill()
+
+        self.assertEqual(self.session.terminate.call_count, 2)
+        pty._close.assert_called_once_with()
+        self.session.close.assert_called_once_with()
+
+    def test_termination_error_takes_precedence_over_local_cleanup_error(self):
+        remote_error = RuntimeError("remote delete failed")
+        self.session.terminate.side_effect = remote_error
+        self.session.close.side_effect = RuntimeError("client close failed")
+        sandbox = Sandbox()
+        pty = MagicMock()
+        pty._close.side_effect = RuntimeError("PTY close failed")
+        sandbox._pty = pty
+
+        with (
+            self.assertLogs(sandbox_module.logger, level="WARNING"),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "remote delete failed",
+            ) as raised,
+        ):
+            sandbox.kill()
+
+        self.assertIs(raised.exception, remote_error)
+        pty._close.assert_called_once_with()
+        self.session.close.assert_called_once_with()
 
     def test_named_delete_hides_backend_namespace(self):
         Sandbox.delete("worker")
-        self.backend.delete_named_instance.assert_called_once_with("worker")
+        self.backend.delete_named.assert_called_once_with("worker")
+
+    def test_failover_is_validated_and_forwarded(self):
+        sandbox = Sandbox(failover=True)
+        spec = self.backend.create.call_args.args[0]
+        self.assertTrue(spec.failover)
+        sandbox.kill()
+
+        with self.assertRaisesRegex(TypeError, "failover must be a boolean"):
+            Sandbox(failover=1)
+
+    def test_inherit_entrypoint_is_validated_and_forwarded(self):
+        self.session.wait_entrypoint.return_value = 17
+        self.session.entrypoint_exit_info = {
+            "status": "exited",
+            "shell_exit_code": 17,
+        }
+        sandbox = Sandbox(
+            image="example/image:latest",
+            inherit_entrypoint=True,
+        )
+        spec = self.backend.create.call_args.args[0]
+        self.assertTrue(spec.inherit_entrypoint)
+        self.assertEqual(sandbox.wait_entrypoint(), 17)
+        self.assertEqual(
+            sandbox.entrypoint_exit_info,
+            {"status": "exited", "shell_exit_code": 17},
+        )
+        sandbox.kill()
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "inherit_entrypoint must be a boolean",
+        ):
+            Sandbox(image="example/image:latest", inherit_entrypoint=1)
+        with self.assertRaisesRegex(
+            ValueError,
+            "inherit_entrypoint requires an image",
+        ):
+            Sandbox(inherit_entrypoint=True)
+
+        sandbox = Sandbox(image="example/image:latest")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "inherit_entrypoint was not enabled",
+        ):
+            sandbox.wait_entrypoint()
+        self.assertIsNone(sandbox.entrypoint_exit_info)
+        sandbox.kill()
+
+    def test_reload_preserves_identity_and_facades(self):
+        self.session.reload.return_value = True
+        sandbox = Sandbox(failover=True)
+        identity = sandbox.id
+        commands = sandbox.commands
+        files = sandbox.files
+        pty = sandbox.pty
+
+        self.assertTrue(sandbox.reload())
+        self.assertEqual(sandbox.id, identity)
+        self.assertIs(sandbox.commands, commands)
+        self.assertIs(sandbox.files, files)
+        self.assertIs(sandbox.pty, pty)
+        self.session.reload.assert_called_once_with()
+
+        sandbox.kill()
+        self.assertFalse(sandbox.reload())
+        self.session.reload.assert_called_once_with()
+
+    def test_reload_returns_false_when_backend_does_not_complete(self):
+        self.session.reload.return_value = False
+        sandbox = Sandbox(failover=True)
+
+        self.assertFalse(sandbox.reload())
+
+        sandbox.kill()
 
     def test_rootfs_requires_s3_config(self):
         with self.assertRaisesRegex(TypeError, "S3Config"):
@@ -84,20 +259,37 @@ class SandboxTest(unittest.TestCase):
                 image="ubuntu:24.04",
                 rootfs=S3Config("https://s3.example.com", "rootfs", "rootfs.img"),
             )
+        self.backend.create.assert_not_called()
 
-    def test_supported_runtimes(self):
-        Sandbox(runtime="kata")
+    def test_runtime_identifier_is_normalized_and_passed_to_backend(self):
+        sandbox = Sandbox(runtime=" gvisor-next ")
+        spec = self.backend.create.call_args.args[0]
+        self.assertEqual(spec.runtime, "gvisor-next")
+        sandbox.kill()
 
-        with self.assertRaisesRegex(ValueError, "unsupported runtime"):
-            Sandbox(runtime="unknown")
+    def test_runtime_identifier_validation(self):
+        for value in (None, 1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(TypeError, "runtime must be a string"),
+            ):
+                Sandbox(runtime=value)
+        for value in ("", "   "):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError, "runtime must be a non-empty string"
+                ),
+            ):
+                Sandbox(runtime=value)
+        self.backend.create.assert_not_called()
 
-    def test_xpu_request_is_normalized_and_passed_to_backend(self):
-        sandbox = Sandbox(xpu=" GPU:L20:02 ")
+    def test_xpu_request_is_normalized_and_delegated_to_backend(self):
+        sandbox = Sandbox(runtime="gpu-runtime", xpu=" GPU:L20:02 ")
         self.assertEqual(sandbox.get_info().xpu, "gpu:l20:2")
-        self.assertEqual(
-            self.backend.build_options.call_args.kwargs["xpu"],
-            "gpu:l20:2",
-        )
+        spec = self.backend.create.call_args.args[0]
+        self.assertEqual(spec.runtime, "gpu-runtime")
+        self.assertEqual(spec.xpu, "gpu:l20:2")
         sandbox.kill()
 
     def test_xpu_request_validation(self):
@@ -113,26 +305,197 @@ class SandboxTest(unittest.TestCase):
         for value, error_type in invalid:
             with self.subTest(value=value), self.assertRaises(error_type):
                 Sandbox(xpu=value)
-        with self.assertRaisesRegex(ValueError, "xpu.*runsc"):
-            Sandbox(runtime="kata", xpu="gpu:l20:1")
-        self.backend.ensure_initialized.assert_not_called()
+        self.backend.create.assert_not_called()
 
-    def test_storage_request_is_passed_to_backend(self):
-        sandbox = Sandbox(storage_mb=256)
+    def test_storage_request_is_delegated_to_backend(self):
+        sandbox = Sandbox(runtime="storage-runtime", storage_mb=256)
         self.assertEqual(sandbox.get_info().storage_mb, 256)
-        self.assertEqual(
-            self.backend.build_options.call_args.kwargs["storage_mb"],
-            256,
-        )
+        spec = self.backend.create.call_args.args[0]
+        self.assertEqual(spec.runtime, "storage-runtime")
+        self.assertEqual(spec.storage_mb, 256)
         sandbox.kill()
 
     def test_storage_request_validation(self):
         for value in (True, 0, -1, 1.5):
             with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
                 Sandbox(storage_mb=value)
-        with self.assertRaisesRegex(ValueError, "storage_mb.*runsc"):
-            Sandbox(runtime="kata", storage_mb=256)
-        self.backend.ensure_initialized.assert_not_called()
+        self.backend.create.assert_not_called()
+
+    def test_block_network_policy_is_passed_to_backend(self):
+        policy = NetworkPolicy.block()
+
+        sandbox = Sandbox(network_policy=policy)
+
+        spec = self.backend.create.call_args.args[0]
+        self.assertIs(spec.network_policy, policy)
+        self.assertEqual(policy.to_dict(), {"blockNetwork": True})
+        sandbox.kill()
+
+    def test_dns_blacklist_is_normalized_and_passed_to_backend(self):
+        policy = NetworkPolicy.deny_dns("GitHub.COM.", "*.GitHub.com", "github.com")
+
+        sandbox = Sandbox(network_policy=policy)
+
+        spec = self.backend.create.call_args.args[0]
+        self.assertEqual(
+            spec.network_policy.to_dict(),
+            {"dnsBlacklist": ["github.com", "*.github.com"]},
+        )
+        sandbox.kill()
+
+    def test_acl_v2_allowlist_is_normalized_and_passed_to_backend(self):
+        policy = NetworkPolicy.allowlist(
+            [
+                NetworkRule(
+                    cidr="10.20.30.40",
+                    protocol="tcp",
+                    port_range=22773,
+                    priority=110,
+                ),
+                NetworkRule(
+                    domain="BÜCHER.example.",
+                    protocol="tcp",
+                    port_range=PortRange(80, 443),
+                ),
+                NetworkRule(protocol="udp", port_range=53),
+            ]
+        )
+
+        sandbox = Sandbox(network_policy=policy)
+
+        spec = self.backend.create.call_args.args[0]
+        self.assertIs(spec.network_policy, policy)
+        self.assertEqual(
+            policy.to_dict(),
+            {
+                "schemaVersion": 2,
+                "traffic": {
+                    "ingressDefaultAction": "allow",
+                    "egressDefaultAction": "deny",
+                    "mode": "stateful",
+                    "rules": [
+                        {
+                            "action": "allow",
+                            "direction": "egress",
+                            "protocol": "tcp",
+                            "priority": 110,
+                            "peer": {
+                                "cidr": "10.20.30.40/32",
+                                "portRange": {"first": 22773, "last": 22773},
+                            },
+                        },
+                        {
+                            "action": "allow",
+                            "direction": "egress",
+                            "protocol": "tcp",
+                            "priority": 100,
+                            "peer": {
+                                "domain": "xn--bcher-kva.example",
+                                "portRange": {"first": 80, "last": 443},
+                            },
+                        },
+                        {
+                            "action": "allow",
+                            "direction": "egress",
+                            "protocol": "udp",
+                            "priority": 100,
+                            "peer": {"portRange": {"first": 53, "last": 53}},
+                        },
+                    ],
+                },
+            },
+        )
+        sandbox.kill()
+
+    def test_acl_v2_supports_low_level_traffic_and_dns_policies(self):
+        policy = NetworkPolicy(
+            traffic=TrafficPolicy(
+                ingress_default_action="deny",
+                egress_default_action="allow",
+                mode="stateless",
+                rules=(
+                    NetworkRule(
+                        action="deny",
+                        direction="ingress",
+                        protocol="tcp",
+                        cidr="192.0.2.129/24",
+                        sandbox_port_range=PortRange(8000, 8010),
+                        priority=200,
+                    ),
+                ),
+            ),
+            dns=DNSPolicy(
+                default_action="deny",
+                rules=(DNSRule("*.example.com", action="allow"),),
+            ),
+        )
+
+        self.assertEqual(policy.to_dict()["schemaVersion"], 2)
+        self.assertEqual(
+            policy.to_dict()["traffic"]["rules"][0]["peer"]["cidr"],
+            "192.0.2.0/24",
+        )
+        self.assertEqual(
+            policy.to_dict()["dns"],
+            {
+                "defaultAction": "deny",
+                "rules": [{"action": "allow", "pattern": "*.example.com"}],
+            },
+        )
+
+    def test_empty_network_policy_is_treated_as_unrestricted(self):
+        sandbox = Sandbox(network_policy=NetworkPolicy())
+
+        spec = self.backend.create.call_args.args[0]
+        self.assertIsNone(spec.network_policy)
+        sandbox.kill()
+
+    def test_invalid_network_policy_is_rejected_before_backend(self):
+        invalid_factories = (
+            lambda: NetworkPolicy(block_network="yes"),
+            lambda: NetworkPolicy(dns_blacklist="github.com"),
+            lambda: NetworkPolicy.deny_dns(),
+            lambda: NetworkPolicy.deny_dns("github.*"),
+            lambda: NetworkPolicy.deny_dns("github.com.."),
+            lambda: NetworkPolicy(block_network=True, dns_blacklist=("github.com",)),
+            lambda: PortRange(0),
+            lambda: PortRange(100, 99),
+            lambda: NetworkRule(cidr="2001:db8::/32"),
+            lambda: NetworkRule(cidr="10.0.0.0/8", domain="example.com"),
+            lambda: NetworkRule(domain="*.example.com", direction="both"),
+            lambda: NetworkRule(protocol="any", port_range=443),
+            lambda: NetworkRule(priority=(1 << 32) - 1),
+            lambda: TrafficPolicy(rules=(NetworkRule(),) * 257),
+            lambda: NetworkPolicy(
+                block_network=True,
+                traffic=TrafficPolicy(),
+            ),
+            lambda: NetworkPolicy.allowlist(()),
+        )
+        for factory in invalid_factories:
+            with (
+                self.subTest(factory=factory),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                factory()
+        with self.assertRaisesRegex(TypeError, "NetworkPolicy"):
+            Sandbox(network_policy={"blockNetwork": True})
+        self.backend.create.assert_not_called()
+
+    def test_cwd_must_be_absolute(self):
+        with self.assertRaisesRegex(ValueError, "absolute POSIX"):
+            Sandbox(cwd="workspace")
+
+    def test_common_resource_validation_happens_before_backend(self):
+        with self.assertRaisesRegex(ValueError, "cpu_limit"):
+            Sandbox(cpu=2000, cpu_limit=1000)
+        for value in (0, -1, -2):
+            with (
+                self.subTest(schedule_timeout=value),
+                self.assertRaisesRegex(ValueError, "schedule_timeout"),
+            ):
+                Sandbox(schedule_timeout=value)
+        self.backend.create.assert_not_called()
 
     def test_port_forwardings_are_integer_ports(self):
         with self.assertRaisesRegex(TypeError, "integer"):
@@ -140,33 +503,225 @@ class SandboxTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             Sandbox(port_forwardings=[8080, 8080])
 
-    def test_reverse_tunnel_lifecycle(self):
+    def test_reverse_tunnel_is_passed_through_spec(self):
         tunnel = HttpReverseTunnel(
-            "https://example.com", reverse_port=9000, listen_port=9001
+            "https://example.com",
+            reverse_port=9000,
+            listen_port=9001,
         )
         sandbox = Sandbox(reverse_tunnel=tunnel)
         self.assertIs(sandbox.reverse_tunnel, tunnel)
         self.assertEqual(sandbox.reverse_tunnel.url, "http://127.0.0.1:9001")
-        self.backend.start_reverse_tunnel.assert_called_once_with(
-            self.handle, tunnel, name=None
-        )
+        spec = self.backend.create.call_args.args[0]
+        self.assertIs(spec.reverse_tunnel, tunnel)
         sandbox.kill()
-        self.client.stop.assert_called_once()
+        self.session.close.assert_called_once_with()
 
     def test_reverse_tunnel_port_conflict(self):
         tunnel = HttpReverseTunnel(
-            "http://127.0.0.1:8000", reverse_port=9000, listen_port=9001
+            "http://127.0.0.1:8000",
+            reverse_port=9000,
+            listen_port=9001,
         )
         with self.assertRaisesRegex(ValueError, "conflict"):
             Sandbox(port_forwardings=[9000], reverse_tunnel=tunnel)
         with self.assertRaisesRegex(ValueError, "conflict"):
             Sandbox(port_forwardings=[9001], reverse_tunnel=tunnel)
 
-    def test_tunnel_start_failure_terminates_instance(self):
-        self.backend.start_reverse_tunnel.side_effect = RuntimeError("timeout")
+    def test_backend_create_failure_is_reported(self):
+        self.backend.create.side_effect = RuntimeError("timeout")
         with self.assertRaisesRegex(RuntimeError, "timeout"):
             Sandbox(reverse_tunnel=HttpReverseTunnel("example.com"), detached=True)
-        self.backend.terminate_instance.assert_called_once_with(self.handle)
+
+    def test_partial_facade_initialization_rolls_back_remote_sandbox(self):
+        with (
+            patch.object(sandbox_module, "Pty", side_effect=RuntimeError("pty")),
+            self.assertRaisesRegex(RuntimeError, "pty"),
+        ):
+            Sandbox(detached=True)
+        self.session.terminate.assert_called_once_with()
+        self.session.close.assert_called_once_with()
+
+    def test_partial_facade_cleanup_preserves_initialization_error(self):
+        self.session.terminate.side_effect = RuntimeError("remote delete failed")
+        self.session.close.side_effect = RuntimeError("client close failed")
+        initialization_error = RuntimeError("PTY initialization failed")
+        with (
+            patch.object(
+                sandbox_module,
+                "Pty",
+                side_effect=initialization_error,
+            ),
+            self.assertLogs(sandbox_module.logger, level="WARNING"),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "PTY initialization failed",
+            ) as raised,
+        ):
+            Sandbox(name="worker", detached=True)
+
+        self.assertIs(raised.exception, initialization_error)
+        self.session.terminate.assert_called_once_with()
+        self.session.close.assert_called_once_with()
+
+    def test_dockerfile_signature_and_mutual_exclusion(self):
+        parameters = inspect.signature(Sandbox).parameters
+        self.assertIn("dockerfile", parameters)
+        self.assertNotIn("context", parameters)
+        self.assertNotIn("auto_start_cmd", parameters)
+        self.assertNotIn("build_run_timeout", parameters)
+
+        dockerfile = DockerfileLaunch(LocalDockerContext("FROM ubuntu\n"))
+        for kwargs in (
+            {"image": "ubuntu", "dockerfile": dockerfile},
+            {
+                "rootfs": S3Config("https://s3.example.com", "bucket", "rootfs"),
+                "dockerfile": dockerfile,
+            },
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                    Sandbox(**kwargs)
+        with self.assertRaisesRegex(TypeError, "dockerfile"):
+            Sandbox(dockerfile=object())  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            Sandbox(context=LocalDockerContext("FROM ubuntu\n"))  # type: ignore[call-arg]
+        self.backend.create.assert_not_called()
+
+    def test_dockerfile_context_is_strict_before_backend_creation(self):
+        unsupported = (
+            "ADD https://example.test/a /opt/",
+            'COPY ["a b", "/dest/"]',
+            'ADD ["a b", "/dest/"]',
+            'RUN ["printf", "%s", "x"]',
+            "WORKDIR app",
+            "ARG VERSION=1",
+            "COPY --chmod=755 a /dest/",
+            "COPY --link a /dest/",
+            "COPY --parents a /dest/",
+            "FROM --platform=linux/amd64 ubuntu",
+        )
+        for instruction in unsupported:
+            with self.subTest(instruction=instruction):
+                dockerfile = (
+                    instruction
+                    if instruction.startswith("FROM")
+                    else f"FROM ubuntu\n{instruction}\n"
+                )
+                with self.assertRaises(DockerfileParseError):
+                    Sandbox(dockerfile=DockerfileLaunch(LocalDockerContext(dockerfile)))
+        self.backend.create.assert_not_called()
+
+    def test_dockerfile_context_uses_base_image_and_applies_after_facades(self):
+        context = LocalDockerContext("FROM ubuntu:24.04\nRUN true\n")
+        dockerfile = DockerfileLaunch(
+            context,
+            auto_start_cmd=False,
+            run_timeout=300,
+        )
+        apply_result = DockerfileApplyResult(
+            start_cmd=None,
+            startup_command=None,
+            entrypoint=None,
+            warnings=(),
+        )
+        with patch(
+            "akernel_sdk._dockerfile_runner.apply_dockerfile",
+            return_value=apply_result,
+        ) as apply:
+            sandbox = Sandbox(dockerfile=dockerfile)
+
+        spec = self.backend.create.call_args.args[0]
+        self.assertEqual(spec.image, "ubuntu:24.04")
+        self.assertIs(apply.call_args.args[0], sandbox)
+        self.assertIsNotNone(sandbox._files)
+        self.assertIsNotNone(sandbox._commands)
+        self.assertIsNotNone(sandbox._pty)
+        self.assertIs(apply.call_args.args[2], context)
+        self.assertFalse(apply.call_args.kwargs["auto_start_cmd"])
+        self.assertEqual(apply.call_args.kwargs["run_timeout"], 300)
+        self.assertIsNone(sandbox.startup_command)
+        sandbox.kill()
+
+    def test_dockerfile_context_exposes_startup_command_handle(self):
+        context = LocalDockerContext('FROM ubuntu:24.04\nCMD ["server"]\n')
+        startup_handle = object()
+        apply_result = DockerfileApplyResult(
+            start_cmd=("server",),
+            startup_command=startup_handle,
+            entrypoint=None,
+            warnings=(),
+        )
+        with patch(
+            "akernel_sdk._dockerfile_runner.apply_dockerfile",
+            return_value=apply_result,
+        ):
+            sandbox = Sandbox(dockerfile=DockerfileLaunch(context))
+
+        self.assertIs(sandbox.startup_command, startup_handle)
+        sandbox.kill()
+
+    def test_dockerfile_context_without_dispatched_command_has_no_startup_handle(self):
+        context = LocalDockerContext("FROM ubuntu:24.04\n")
+        for auto_start_cmd in (False, True):
+            with self.subTest(auto_start_cmd=auto_start_cmd):
+                apply_result = DockerfileApplyResult(
+                    start_cmd=None,
+                    startup_command=None,
+                    entrypoint=None,
+                    warnings=(),
+                )
+                with patch(
+                    "akernel_sdk._dockerfile_runner.apply_dockerfile",
+                    return_value=apply_result,
+                ):
+                    sandbox = Sandbox(
+                        dockerfile=DockerfileLaunch(
+                            context,
+                            auto_start_cmd=auto_start_cmd,
+                        )
+                    )
+                self.assertIsNone(sandbox.startup_command)
+                sandbox.kill()
+
+    def test_dockerfile_startup_dispatch_failure_terminates_and_closes_session(self):
+        startup_error = DockerfileBuildError(
+            "Failed to dispatch startup command",
+            instruction="CMD",
+        )
+        with patch(
+            "akernel_sdk._dockerfile_runner.apply_dockerfile",
+            side_effect=startup_error,
+        ):
+            with self.assertRaises(DockerfileBuildError) as raised:
+                Sandbox(
+                    dockerfile=DockerfileLaunch(
+                        LocalDockerContext('FROM ubuntu\nCMD ["server"]\n')
+                    ),
+                    detached=True,
+                )
+
+        self.assertIs(raised.exception, startup_error)
+        self.session.terminate.assert_called_once_with()
+        self.session.close.assert_called_once_with()
+
+    def test_dockerfile_build_failure_terminates_and_closes_detached_session(self):
+        build_error = DockerfileBuildError("RUN failed")
+        with patch(
+            "akernel_sdk._dockerfile_runner.apply_dockerfile",
+            side_effect=build_error,
+        ):
+            with self.assertRaises(DockerfileBuildError) as raised:
+                Sandbox(
+                    dockerfile=DockerfileLaunch(
+                        LocalDockerContext("FROM ubuntu\nRUN false\n")
+                    ),
+                    detached=True,
+                )
+
+        self.assertIs(raised.exception, build_error)
+        self.session.terminate.assert_called_once_with()
+        self.session.close.assert_called_once_with()
 
     def test_get_port_url(self):
         with patch.dict(
@@ -182,6 +737,28 @@ class SandboxTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not in port_forwardings"):
                 sandbox.get_port_url(9090)
             sandbox.kill()
+
+    def test_update_network_policy_normalizes_and_delegates(self):
+        sandbox = Sandbox()
+        policy = NetworkPolicy.deny_dns("github.com")
+
+        sandbox.update_network_policy(policy)
+        sandbox.update_network_policy(NetworkPolicy())
+        sandbox.update_network_policy(None)
+
+        self.assertEqual(
+            self.session.update_network_policy.call_args_list,
+            [
+                unittest.mock.call(policy),
+                unittest.mock.call(None),
+                unittest.mock.call(None),
+            ],
+        )
+        with self.assertRaises(TypeError):
+            sandbox.update_network_policy({"blockNetwork": True})
+        sandbox.kill()
+        with self.assertRaises(RuntimeError):
+            sandbox.update_network_policy(None)
 
 
 if __name__ == "__main__":

@@ -124,6 +124,7 @@ node:
       memoryLimit: "2G"
       cpuQuota: "100%"
     sandboxd:
+      enableRunc: ${enable_runc}
       config: |-
         rootDir="/home/akernel/sandboxd/root"
         storeDir="/home/akernel/sandboxd/store"
@@ -135,8 +136,9 @@ node:
         stream_server_port=""
 
         [plugin.network]
-        ip_range="172.17.0.1/16"
+        ip_range="10.88.0.1/16"
         nat_backend="${sandboxd_nat_backend}"
+        enable_network_acl=true
 
         [plugin.resource]
         cgroup_cache_size=800
@@ -149,22 +151,39 @@ node:
 
         [plugin.runtime]
         image_lib_dir="/home/akernel/images"
-        filestore_dir="/home/akernel/xfs"
+        filestore_dir="/home/akernel/filestore"
         filestore_dir_size="200G"
+        filestore_xfs_enabled=false
+        loop_device_dir="/dev"
         overlay_tmpfs_size="10G"
 
         [plugin.runtime.basic_spec]
         runsc="/home/akernel/images/config.json"
+        runc=""
+        firecracker="/home/akernel/images/config.json"
 
         [plugin.runtime.runtime_binary]
         runsc="/usr/local/bin/runsc"
         kata="/usr/local/bin/containerd-shim-kata-v2"
+        firecracker="/usr/local/bin/firecracker"
+        # AKERNEL_RUNTIME_RUNC
+
+        [plugin.runtime.firecracker]
+        virtiofs_enabled=true
+        virtiofsd_path="/usr/local/bin/virtiofsd"
+        writable_io_engine="AsyncDirect"
+        writable_cache_type="Writeback"
 
         [plugin.runtime.kata]
         config_path="/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball.toml"
         kvm_device="/dev/kvm"
         dan_config_dir="/run/kata-containers/dans"
         logger_binary="/usr/local/bin/sandbox-logger"
+
+        [plugin.runtime.runc]
+        state_root="/run/sandboxd/runc"
+        shim_binary="/usr/local/bin/runc-shim"
+        kvm_device="/dev/kvm"
 
         # image-manager config. root holds image-manager runtime state
         # (daemons/, mount_records.db) and is wiped on pod change; input

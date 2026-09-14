@@ -87,29 +87,6 @@ node:
             values:
             - dragonfly-seed
             - dragonfly-server
-%{ if node_pool_extra_data_disk_enabled ~}
-  initContainers:
-  - name: wait-for-storage
-    image: "${node_storage_init_image}"
-    command:
-    - /bin/sh
-    - -c
-    - |
-      # NOTE: don't use `mountpoint -q ${node_storage_init_mount_path}` here. Inside this init
-      # container ${node_storage_init_mount_path} is a kubelet bind mount of the host hostPath,
-      # so it is *already* a mountpoint regardless of whether the host has finished mounting
-      # the data disk underneath. Poll the marker file written by the host user_data script
-      # (data-disk-mount.sh.tftpl) instead — it appears only after mkfs + mount succeed.
-      echo "[init] Waiting for storage at ${node_storage_init_mount_path}/.storage-ready ..."
-      while [ ! -f ${node_storage_init_mount_path}/.storage-ready ]; do
-        sleep 5
-      done
-      echo "[init] Storage ready."
-    volumeMounts:
-    - name: home-disk
-      mountPath: ${node_storage_init_mount_path}
-      mountPropagation: HostToContainer
-%{ endif ~}
   image:
     repository: "${node_image_repository}"
     tag: "${node_image_tag}"
@@ -118,6 +95,7 @@ node:
       ephemeral-storage: "${node_ephemeral}"
     requests:
       ephemeral-storage: "${node_ephemeral}"
+  hostDiskPath: "${node_host_disk_path}"
   homeDisk:
     useEphemeralPVC: ${node_home_use_csi_ephemeral}
     storageClassName: "${node_home_csi_storage_class}"
@@ -166,6 +144,7 @@ node:
       memoryLimit: "2G"
       cpuQuota: "100%"
     sandboxd:
+      enableRunc: ${enable_runc}
       config: |-
         rootDir="/home/akernel/sandboxd/root"
         storeDir="/home/akernel/sandboxd/store"
@@ -177,8 +156,9 @@ node:
         stream_server_port=""
 
         [plugin.network]
-        ip_range="172.17.0.1/16"
+        ip_range="10.88.0.1/16"
         nat_backend="${sandboxd_nat_backend}"
+        enable_network_acl=true
 
         [plugin.resource]
         cgroup_cache_size=800
@@ -191,22 +171,41 @@ node:
 
         [plugin.runtime]
         image_lib_dir="/home/akernel/images"
-        filestore_dir="/home/akernel/xfs"
-        filestore_dir_size="200G"
+        # The Aliyun module mounts a dedicated filesystem at /home/akernel.
+        # Leave filestore_dir_size unset so sandboxd consumes the native XFS
+        # directory instead of creating a loop-backed bounded filesystem.
+        filestore_dir="/home/akernel/filestore"
+        filestore_xfs_enabled=false
+        loop_device_dir="/dev"
         overlay_tmpfs_size="10G"
 
         [plugin.runtime.basic_spec]
         runsc="/home/akernel/images/config.json"
+        runc=""
+        firecracker="/home/akernel/images/config.json"
 
         [plugin.runtime.runtime_binary]
         runsc="/usr/local/bin/runsc"
         kata="/usr/local/bin/containerd-shim-kata-v2"
+        firecracker="/usr/local/bin/firecracker"
+        # AKERNEL_RUNTIME_RUNC
+
+        [plugin.runtime.firecracker]
+        virtiofs_enabled=true
+        virtiofsd_path="/usr/local/bin/virtiofsd"
+        writable_io_engine="AsyncDirect"
+        writable_cache_type="Writeback"
 
         [plugin.runtime.kata]
         config_path="/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball.toml"
         kvm_device="/dev/kvm"
         dan_config_dir="/run/kata-containers/dans"
         logger_binary="/usr/local/bin/sandbox-logger"
+
+        [plugin.runtime.runc]
+        state_root="/run/sandboxd/runc"
+        shim_binary="/usr/local/bin/runc-shim"
+        kvm_device="/dev/kvm"
 
         # image-manager config. root holds image-manager runtime state
         # (daemons/, mount_records.db) and is wiped on pod change; input

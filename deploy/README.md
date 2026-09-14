@@ -25,7 +25,93 @@ make print-env
 make e2e
 ```
 
-Kata Containers is enabled in the default AKernel runtime configuration and adds one host requirement: `/dev/kvm` must be available to the node container. Nodes without a usable KVM device remain ready and advertise only runsc. If no node advertises Kata, `Sandbox(runtime="kata")` fails scheduling with a no-resource error.
+Kata Containers and Firecracker are enabled in the default AKernel image and
+runtime configuration. Both require `/dev/kvm` to be available to the node
+container. Nodes without a usable KVM device remain ready for runsc workloads
+and do not advertise either VM runtime. If no eligible node advertises a
+requested runtime, `Sandbox(runtime="kata")` or
+`Sandbox(runtime="firecracker")` fails scheduling with a no-resource error.
+
+The bundled Firecracker VMM and guest kernel are selected by sandboxd's shared
+runtime manifest, and its guest-agent initrd is built from that same sandboxd
+revision. AKernel also builds pinned virtiofsd 1.14.0 with its release lockfile
+and enables read-only virtio-fs in standalone and Helm. OCI/Nydus image roots
+use the directory provided by the image manager directly, without EROFS
+conversion. The sandbox's writable layer remains a private ext4 image;
+writable host sharing and OCI image mounts are unsupported. EROFS roots and
+mounts remain supported. Set `AKERNEL_ENABLE_FIRECRACKER=false` while building
+to exclude the VMM, kernel, virtiofsd, and initrd.
+
+The default writable disk policy is `AsyncDirect` with `Writeback`. Hosts must
+provide usable `io_uring` and filesystem alignment queries through
+`statx(STATX_DIOALIGN)` (normally ext4/XFS on Linux 6.1 or newer). Capability
+checks, rather than the kernel version alone, determine compatibility. There
+is no automatic buffered fallback. For older hosts, explicitly configure
+`writable_io_engine="Async"`, or `"Sync"` without io_uring, under
+`[plugin.runtime.firecracker]` in the standalone config or Helm's
+`node.config.sandboxd.config`. Keep `writable_cache_type="Writeback"`.
+
+Drain sandboxes before replacing the Firecracker stack. Checkpoints record
+VMM, kernel, initrd, and, when used, virtiofsd digests; mismatched stacks are
+rejected on restore. Changing the writable I/O default does not convert the
+engine saved in an existing checkpoint. For the full contract, see the
+[sandbox runtime comparison](https://github.com/inclusionAI/sandboxd/blob/b8f4656c57432bce1b50111e766bcd21510ee482/doc/runtime.md).
+
+The native Linux runc backend is opt-in because it uses the host kernel. For a
+guided cloud profile, `make config ENABLE_RUNC=true` records both sides of the
+selection: `make build` includes the checksum-pinned runc payload, and
+Terraform registers the runtime with sandboxd. Direct Helm users must likewise
+build with `AKERNEL_ENABLE_RUNC=true` and set
+`node.config.sandboxd.enableRunc=true`.
+
+The iptables sandbox NAT backend remains the default. Terraform deployments
+can set `sandboxd_nat_backend = "bpfnat"` to use sandboxd's experimental
+embedded TC eBPF backend on nodes without iptables NAT or conntrack modules.
+The node must support TC eBPF and bpffs. bpfnat does not manage host firewall
+policy, so custom host-network deployments must allow forwarding to and from
+the sandbox bridge when their `FORWARD` policy is `DROP`.
+
+### systemd container identity
+
+The all-in-one image, Helm node template, and standalone launcher set
+`container=oci` so PID 1 systemd recognizes the container and does not remount
+shared host filesystems read-only during shutdown. Preserve this variable in
+custom launchers. Applying the fix requires replacing the node Pod or
+standalone container; it does not repair an already read-only filesystem.
+
+### Network ACLs
+
+The bundled standalone, Helm, and Terraform sandboxd configurations enable
+per-sandbox network ACLs. Runsc, Kata, and Firecracker require the host `tun`
+module and a usable `/dev/net/tun` for their pooled TAP endpoints. A sandbox
+created without a policy remains on the unrestricted fast path. The default
+`iptables` backend additionally requires the `iptables`, `ip6tables`, and
+`ipset` userspace commands; IPv4/IPv6 filter-table, `br_netfilter`,
+`xt_physdev`, conntrack and conntrack-netlink, connmark/CONNMARK, and
+timeout-capable `hash:ip` ipset support; and both bridge netfilter sysctls for
+iptables and ip6tables set to `1`. Sandboxd probes the IPv6 physdev rule and
+the required ipset type when it initializes this backend. The optional `bpfnat`
+backend instead requires Linux 5.17 or newer for `bpf_loop`, eBPF
+`SCHED_CLS`, TC `clsact`,
+supported hash and array maps, a writable bpffs at `/sys/fs/bpf` (or
+permission to mount one), and permission to load BPF programs and manage TC
+filters. Both backends require TCP and UDP port 53 on the sandbox bridge to be
+free and at least one usable upstream nameserver. AKernel's privileged node
+container prepares the selected backend's namespace-local settings. Host
+provisioning must load the required kernel modules before the node pod starts;
+the Terraform node bootstrap does this automatically.
+
+Drain all sandboxes from a node before enabling ACLs or upgrading an existing
+deployment to a release that enables them. Sandboxd deliberately refuses to
+start ACL support when its store contains pre-ACL sandboxes, preventing a
+silent fail-open migration. Start new sandboxes only after the upgraded
+sandboxd is healthy.
+
+Sandboxd selects the ACL implementation matching the configured `iptables` or
+`bpfnat` NAT backend. DNS policies manage each sandbox's `/etc/resolv.conf`; a
+caller mount that owns that path is rejected while ACL support is enabled.
+Schema v2 domain traffic rules also use the managed DNS proxy to install
+TTL-bound address grants, even when no separate DNS policy is supplied.
 
 `make config` is interactive by default. It writes:
 
@@ -261,6 +347,12 @@ through its own LoadBalancer when `install_monitor=true`. Set
 `install_dragonfly=true` to install the pinned official Dragonfly chart and
 inject its seed-client proxy into the node runtime configuration.
 
+Terraform-managed Alibaba Cloud nodes also receive a dedicated 300 GiB XFS
+disk mounted at `/home/akernel` by default. sandboxd consumes that native
+filesystem directly for writable layers and local checkpoints, without a
+loop-backed filestore. See the Aliyun guide for capacity, opt-out, and node
+replacement details.
+
 Only the AKernel all-in-one image is pushed to the registry selected by
 `make config`. etcd, Traefik, Grafana, Prometheus, Loki, Tempo, and BusyBox use
 their pinned official public images by default. Set the per-component image
@@ -275,3 +367,11 @@ deploy/
 ├── terraform/      # multi-cloud provisioning (aliyun, huaweicloud, shared)
 └── scripts/        # deployment and image helper scripts
 ```
+
+### distill-fs release dependency
+
+The all-in-one image downloads the static Linux/amd64 distill-fs release pinned in `builder/distill-fs-versions.env`. It does not compile `src/distill-fs`; that checkout is optional source reference. `make versions` reports the release tag and archive SHA-256. The AKernel installer at `builder/scripts/install-distill-fs.sh` checks the archive, package provenance, CLI version, and static ELF linkage, and retains licenses and provenance in `/usr/local/share/distill-fs`.
+
+Publish and verify the distill-fs release before updating the AKernel version, URL, and checksum pin together. Missing or invalid pins stop `make build` before either image is built. There is no source-build fallback.
+
+Validate installation against a downloaded candidate or release with `python3 builder/scripts/test-install-distill-fs.py /path/to/distill-fs-vX.Y.Z-linux-amd64.tar.gz` on Linux/amd64 with curl, jq, and binutils. This checks normal installation and rejects missing/invalid pins, corrupted archives, version/architecture mismatch, binary hash mismatch, and dynamically linked executables. The sandboxd pipeline and gitlink are independent of this dependency.

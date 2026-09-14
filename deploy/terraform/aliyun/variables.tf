@@ -199,6 +199,18 @@ variable "node_pool_zone_id" {
   default     = ""
 }
 
+variable "node_pool_pids_limit" {
+  type        = number
+  description = "Per-Pod PID budget for the default and user-supplied extra ACK node pools, shared by all sandboxes and runtime services."
+  default     = 1620780
+  nullable    = false
+
+  validation {
+    condition     = var.node_pool_pids_limit == -1 || (var.node_pool_pids_limit > 0 && floor(var.node_pool_pids_limit) == var.node_pool_pids_limit)
+    error_message = "node_pool_pids_limit must be a positive integer or -1 (node allocatable PID capacity)."
+  }
+}
+
 variable "node_pool_size" {
   type        = number
   description = "Desired node count in the default node pool."
@@ -237,8 +249,8 @@ variable "node_pool_data_disk_size" {
 
 variable "node_pool_extra_data_disk_enabled" {
   type        = bool
-  description = "Whether to attach an extra data disk for akernel hostPath storage (separate from the container runtime data disk)."
-  default     = false
+  description = "Whether to attach and mount a dedicated data disk for AKernel hostPath storage, separate from the container runtime data disk."
+  default     = true
 }
 
 variable "node_pool_extra_data_disk_category" {
@@ -255,19 +267,29 @@ variable "node_pool_extra_data_disk_size" {
 
 variable "node_pool_extra_data_disk_mount_path" {
   type        = string
-  description = "Path to auto-format and mount the extra data disk. Typically /home/akernel for akernel node hostPath storage."
+  description = "Path where ACK formats and mounts the dedicated AKernel data disk."
   default     = "/home/akernel"
+
+  validation {
+    condition     = startswith(var.node_pool_extra_data_disk_mount_path, "/") && var.node_pool_extra_data_disk_mount_path != "/"
+    error_message = "node_pool_extra_data_disk_mount_path must be an absolute path other than /."
+  }
 }
 
 variable "node_pool_extra_data_disk_fs_type" {
   type        = string
-  description = "Filesystem type for the extra data disk (ext4 or xfs)."
-  default     = "ext4"
+  description = "Filesystem type for the dedicated AKernel data disk. XFS enables the high-performance reflink checkpoint path; ext4 is retained for compatibility."
+  default     = "xfs"
+
+  validation {
+    condition     = contains(["ext4", "xfs"], var.node_pool_extra_data_disk_fs_type)
+    error_message = "node_pool_extra_data_disk_fs_type must be ext4 or xfs."
+  }
 }
 
 variable "node_storage_init_image" {
   type        = string
-  description = "Image for the storage readiness init container. Only used when node_pool_extra_data_disk_enabled=true."
+  description = "Deprecated compatibility variable. ACK now formats and mounts the dedicated data disk before joining the node."
   default     = "busybox:1.36"
 }
 
@@ -311,8 +333,14 @@ variable "extra_node_pools" {
 
 variable "sandboxd_nat_backend" {
   type        = string
-  description = "Sandboxd NAT backend. When set to 'iptables', ip_tables kernel module will be loaded at boot."
+  description = "Sandboxd NAT backend. The iptables mode loads IPv4/IPv6 bridge-netfilter modules at boot."
   default     = "iptables"
+}
+
+variable "enable_runc" {
+  type        = bool
+  description = "Request the optional runc runtime; the selected node image must be built with AKERNEL_ENABLE_RUNC=true."
+  default     = false
 }
 
 variable "node_home_use_csi_ephemeral" {

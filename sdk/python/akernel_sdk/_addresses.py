@@ -16,8 +16,8 @@
 
 The public SDK accepts a compact ``AKERNEL_SERVER_ADDRESS`` value:
 
-* ``host``: public mode.  Frontend API and exec WebSocket use 443/TLS; public
-  port-forward URLs use 80/plain HTTP.
+* ``host:port``: shared-port mode.  Frontend API and exec WebSocket use the
+  explicit port with TLS; public port-forward URLs use it with plain HTTP.
 * ``host:port``: shared-port mode.  Frontend API, exec WebSocket, and public
   port-forward URLs all use the explicit port with TLS by default.
 
@@ -123,7 +123,7 @@ def gateway_endpoint_from_env() -> Endpoint:
     An explicit gateway override is parsed as plain HTTP by default because
     standalone exposes Traefik's web entrypoint without TLS.  Without an
     explicit gateway, host-only server addresses use public 80, while
-    host:port server addresses share the API port and TLS setting.
+    host:port server addresses reuse the API port with plain HTTP.
     """
     override = _gateway_override_raw()
     if override:
@@ -138,7 +138,7 @@ def gateway_endpoint_from_env() -> Endpoint:
         return Endpoint(
             host=server.host,
             port=server.port,
-            scheme=server.scheme,
+            scheme="http",
             explicit_port=True,
         )
     return Endpoint(
@@ -152,15 +152,7 @@ def gateway_endpoint_from_env() -> Endpoint:
 def exec_endpoint_from_env() -> Endpoint:
     """Return the endpoint used by the exec WebSocket (/terminal/ws).
 
-    File copy uses the frontend exec WebSocket.  If users set an explicit
-    gateway override, respect it; otherwise use the API endpoint so the
-    default cluster/public path is WSS on 443 or the explicit server port.
+    File copy and PTY traffic terminate on the frontend alongside the API, so
+    they always follow AKERNEL_SERVER_ADDRESS.
     """
-    override = _gateway_override_raw()
-    if override:
-        return _parse_endpoint(
-            override,
-            default_port=DEFAULT_PUBLIC_PORT,
-            default_scheme="http",
-        )
     return api_endpoint_from_env()

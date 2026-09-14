@@ -16,21 +16,40 @@
 
 import importlib
 
+from ._backends.errors import (
+    BackendNotInstalledError,
+    BackendOperationError,
+    InvalidBackendError,
+    UnsupportedBackendFeatureError,
+)
+from ._backends.registry import selected_backend
 from .types import (
     CommandInfo,
     CommandResult,
+    DNSPolicy,
+    DNSRule,
     EntryInfo,
     HttpReverseTunnel,
     Mount,
+    NetworkPolicy,
+    NetworkRule,
     NodeInfo,
+    PortRange,
     S3Config,
     SandboxInfo,
+    TrafficPolicy,
 )
 
 __all__ = [
     "Sandbox",
     "S3Config",
     "Mount",
+    "NetworkPolicy",
+    "NetworkRule",
+    "PortRange",
+    "TrafficPolicy",
+    "DNSPolicy",
+    "DNSRule",
     "HttpReverseTunnel",
     "CommandResult",
     "CommandInfo",
@@ -42,6 +61,24 @@ __all__ = [
     "PtySession",
     "PtyError",
     "resources",
+    "get_backend",
+    "InvalidBackendError",
+    "BackendNotInstalledError",
+    "UnsupportedBackendFeatureError",
+    "BackendOperationError",
+    "DockerContext",
+    "DockerfileLaunch",
+    "DockerContextEntry",
+    "LocalDockerContext",
+    "parse_dockerfile",
+    "check_direct_launch",
+    "apply_dockerfile",
+    "ParsedDockerfile",
+    "DockerfileApplyResult",
+    "DockerfileCheckResult",
+    "DockerfileBuildError",
+    "DockerfileParseError",
+    "BuildInstruction",
 ]
 
 _LAZY_IMPORTS = {
@@ -50,8 +87,27 @@ _LAZY_IMPORTS = {
     "Pty": (".pty", "Pty"),
     "PtySession": (".pty", "PtySession"),
     "PtyError": (".pty", "PtyError"),
-    "resources": ("._openyuanrong", "resources"),
+    "resources": ("._resources", "resources"),
+    "DockerContext": ("._dockercontext", "DockerContext"),
+    "DockerfileLaunch": ("._dockerfile_launch", "DockerfileLaunch"),
+    "DockerContextEntry": ("._dockercontext", "DockerContextEntry"),
+    "LocalDockerContext": ("._dockercontext", "LocalDockerContext"),
+    "parse_dockerfile": ("._dockerfile", "parse_dockerfile"),
+    "check_direct_launch": ("._dockerfile", "check_direct_launch"),
+    "ParsedDockerfile": ("._dockerfile", "ParsedDockerfile"),
+    "DockerfileCheckResult": ("._dockerfile", "DockerfileCheckResult"),
+    "DockerfileParseError": ("._dockerfile", "DockerfileParseError"),
+    "BuildInstruction": ("._dockerfile", "BuildInstruction"),
+    "apply_dockerfile": ("._dockerfile_runner", "apply_dockerfile"),
+    "DockerfileApplyResult": ("._dockerfile_runner", "DockerfileApplyResult"),
+    "DockerfileBuildError": ("._dockerfile", "DockerfileBuildError"),
 }
+
+
+def get_backend() -> str | None:
+    """Return the backend selected during package import without loading it."""
+
+    return selected_backend()
 
 
 def __getattr__(name: str) -> object:

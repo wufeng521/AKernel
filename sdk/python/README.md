@@ -1,30 +1,46 @@
 # AKernel Python SDK
 
-`akernel-sdk` is the Python interface for creating and managing remote AKernel sandboxes. Applications use one stable API for commands, files, interactive PTYs, port forwarding, and reverse tunnels. The current implementation uses `openYuanrong` as its backend adapter; backend-specific handles and namespaces are not part of the public API.
+`akernel-sdk` is the Python interface for creating and managing remote AKernel
+sandboxes. Applications use one stable API for commands, files, interactive
+PTYs, port forwarding, and reverse tunnels.
+
+It supports two backends:
+
+- `openyuanrong-sandbox` (default), using a RESTful API and Rust runtime.
+- `openyuanrong-sdk` (deprecated compatibility backend), using YuanRong actors
+  and a Python runtime.
 
 ## Navigation
 
-- [Install and configure](#install-and-configure)
-- [Create a sandbox](#create-a-sandbox)
-- [Commands](#commands)
-- [Filesystem](#filesystem)
-- [Interactive PTYs](#interactive-ptys)
-- [Port forwarding](#port-forwarding)
-- [Reverse tunnels](#reverse-tunnels)
-- [Rootfs and mounts](#rootfs-and-mounts)
-- [Resources and lifecycle](#resources-and-lifecycle)
-- [CLI](#cli)
-- [Examples and tests](#examples-and-tests)
+- [AKernel Python SDK](#akernel-python-sdk)
+  - [Navigation](#navigation)
+  - [Install and configure](#install-and-configure)
+  - [Create a sandbox](#create-a-sandbox)
+    - [Experimental GPU and writable storage](#experimental-gpu-and-writable-storage)
+    - [Network ACLs](#network-acls)
+  - [Sandbox runtimes](#sandbox-runtimes)
+  - [Commands](#commands)
+  - [Filesystem](#filesystem)
+  - [Interactive PTYs](#interactive-ptys)
+  - [Port forwarding](#port-forwarding)
+  - [Local failover and reload](#local-failover-and-reload)
+  - [Reverse tunnels](#reverse-tunnels)
+  - [Rootfs and mounts](#rootfs-and-mounts)
+  - [Launch from a Dockerfile](#launch-from-a-dockerfile)
+  - [Resources and lifecycle](#resources-and-lifecycle)
+  - [CLI](#cli)
+  - [Examples and tests](#examples-and-tests)
+  - [Public value types](#public-value-types)
 
 ## Install and configure
 
-AKernel SDK 0.1.0 requires Python 3.10 or newer.
+AKernel SDK requires Python 3.10 or newer.
 
 ```bash
 pip install akernel-sdk
 ```
 
-To install from a source checkout:
+To install from source:
 
 ```bash
 python -m pip install ./sdk/python
@@ -42,11 +58,20 @@ Address behavior is deterministic:
 - A host or IP without a port uses HTTPS/WSS on 443 for the frontend and HTTP
   on 80 for public sandbox port URLs.
 - `host:port` uses that port as a shared HTTPS/WSS endpoint.
-- `AKERNEL_GATEWAY_ADDRESS` overrides the port-forwarding and exec gateway for
-  standalone or custom topologies. An override without a scheme uses HTTP/WS.
+- `AKERNEL_GATEWAY_ADDRESS` overrides only the port-forwarding and reverse
+  tunnel gateway for standalone or custom topologies. An override without a
+  scheme uses HTTP/WS. Exec and file transfer continue to use
+  `AKERNEL_SERVER_ADDRESS`.
 
-The standalone launcher prints the Traefik container IP to use as
-`AKERNEL_SERVER_ADDRESS`.
+The actor-based `openyuanrong-sdk` backend is deprecated and retained only for
+compatibility with existing applications. New applications should use
+`openyuanrong-sandbox`. If compatibility requires the actor backend, install
+and select it before importing `akernel_sdk`:
+
+```bash
+pip install "akernel-sdk[openyuanrong-sdk]"
+export AKERNEL_BACKEND=openyuanrong-sdk
+```
 
 ## Create a sandbox
 
@@ -82,10 +107,11 @@ Sandbox(
     *,
     xpu: str | None = None,
     storage_mb: int | None = None,
+    network_policy: NetworkPolicy | None = None,
+    dockerfile: DockerfileLaunch | None = None,
+    extra_config: Mapping[str, object] | None = None,
 )
 ```
-
-`cpu` is measured in millicores and `memory` in MiB. A zero CPU or memory limit means the limit follows the corresponding request. A positive limit must not be smaller than its request.
 
 ### Experimental GPU and writable storage
 
@@ -98,8 +124,9 @@ with Sandbox(xpu="gpu:l20:1") as sandbox:
 
 The `type:model:count` value is case-insensitive and canonicalized to lower
 case. The model is required and matched exactly; wildcard models are not
-supported. GPU sandboxes currently require the gVisor `runsc` runtime and a
-node configured for gVisor nvproxy.
+supported. The bundled backend currently requires the gVisor `runsc` runtime
+and a node configured for gVisor nvproxy. Runtime compatibility is validated
+by the backend rather than the SDK.
 
 Set the writable root filesystem quota in MiB:
 
@@ -108,23 +135,191 @@ with Sandbox(storage_mb=20 * 1024) as sandbox:
     print(sandbox.commands.run("df -h /").stdout)
 ```
 
-An explicit `storage_mb` quota currently requires `runsc` and uses sandboxd's
-disk-backed XFS filestore. When it is omitted, sandboxd retains its configured
-default 10 GiB memory-backed writable overlay. See
+The bundled backend currently requires `runsc` for an explicit `storage_mb`
+quota and uses sandboxd's disk-backed XFS filestore. Runtime compatibility is
+validated by the backend. When `storage_mb` is omitted, sandboxd retains its
+configured default 10 GiB memory-backed writable overlay. See
 [`examples/gpu_sandbox.py`](./examples/gpu_sandbox.py) and
 [`examples/storage_sandbox.py`](./examples/storage_sandbox.py).
 
-## Sandbox runtimes
+### Network ACLs
 
-AKernel uses the gVisor `runsc` runtime when `runtime` is omitted. Callers may also select `runsc` explicitly or request Kata Containers:
+Omit `network_policy` to leave all sandbox networking unrestricted. An empty
+`NetworkPolicy()` is equivalent and is omitted from the creation request:
 
 ```python
-default_sandbox = Sandbox()
-runsc_sandbox = Sandbox(runtime="runsc")
-kata_sandbox = Sandbox(runtime="kata")
+from akernel_sdk import NetworkPolicy, Sandbox
+
+with Sandbox() as unrestricted:
+    print(unrestricted.commands.run("python3 -c 'import socket; "
+                                    "socket.getaddrinfo(\"github.com\", 443)'"))
 ```
 
-Kata requires at least one cluster node whose sandboxd instance successfully initialized the Kata runtime with a usable `/dev/kvm` device. Nodes without KVM remain available for runsc workloads and do not advertise Kata; when no eligible Kata node exists, the scheduler returns a no-resource error.
+Block new sandbox flows except the YuanRong control proxy and published
+sandbox-port routes with the compatibility helper:
+
+```python
+with Sandbox(network_policy=NetworkPolicy.block()) as sandbox:
+    result = sandbox.commands.run("printf 'control plane still works'")
+    assert result.exit_code == 0
+```
+
+Commands and lifecycle operations continue to work in block mode. The policy
+also publishes the sandbox targets required by direct filesystem I/O, reverse
+tunnels, and explicit `port_forwardings`. Replies on those allowed paths are
+stateful. Other new network flows remain denied.
+
+Deny conventional DNS lookups for exact names or leading `*.` suffix
+patterns:
+
+```python
+policy = NetworkPolicy.deny_dns("github.com", "*.github.com")
+with Sandbox(network_policy=policy) as sandbox:
+    blocked = sandbox.commands.run(
+        "python3 -c 'import socket; socket.getaddrinfo(\"github.com\", 443)'"
+    )
+    assert blocked.exit_code != 0
+```
+
+An exact pattern matches only that name. For example, `github.com` does not
+match `api.github.com`, while `*.github.com` matches descendants but not
+the apex. Supply both when both should be denied. Patterns are normalized to
+lower-case ASCII without a trailing dot; international names are converted to
+punycode. Each pattern may be an exact name or begin with one leading
+`*.`. The remaining name is at most 253 characters; each dot-separated label
+is 1-63 letters, digits, underscores, or hyphens, and a hyphen cannot start or
+end a label. Other wildcard placements and `?` are rejected.
+
+Create an egress allowlist with the high-level helper. Rules may select an
+IPv4 address or CIDR, an exact or leading-wildcard DNS name, TCP or UDP peer
+ports, and a priority:
+
+```python
+from akernel_sdk import NetworkRule, PortRange
+
+policy = NetworkPolicy.allowlist(
+    [
+        NetworkRule(
+            domain="*.example.com",
+            protocol="tcp",
+            port_range=PortRange(443),
+            priority=200,
+        ),
+        NetworkRule(
+            cidr="192.0.2.10",
+            protocol="tcp",
+            port_range=PortRange(8000, 8010),
+        ),
+    ]
+)
+with Sandbox(network_policy=policy) as sandbox:
+    print(sandbox.commands.run("curl https://api.example.com").stdout)
+```
+Replace the complete policy of a running sandbox atomically with
+`update_network_policy`. Passing `None` or an empty `NetworkPolicy()`
+clears the policy and restores unrestricted networking:
+
+```python
+with Sandbox() as sandbox:
+    sandbox.update_network_policy(NetworkPolicy.block())
+    sandbox.update_network_policy(
+        NetworkPolicy.deny_dns("github.com", "*.github.com")
+    )
+    sandbox.update_network_policy(None)
+```
+
+The desired policy survives sandboxd restarts, explicit reloads, and same-node
+failover. Dynamic replacement is supported by the default
+`openyuanrong-sandbox` backend; the actor-based backend rejects it explicitly.
+
+For independent ingress and egress defaults, deny rules, sandbox-side port
+ranges, DNS allowlists, or stateless matching, construct the schema v2 model
+directly with `TrafficPolicy`, `NetworkRule`, `DNSPolicy`, and `DNSRule`.
+Traffic rules are evaluated by highest priority first; an equal-priority deny
+wins. Stateful mode is the default and permits reply traffic. Priority
+`4294967295` is reserved for control-plane and published-port rules, so user
+priorities are limited to `1..4294967294`.
+In stateless mode, a protected published-port rule covers ingress only; add an
+explicit egress rule for the matching sandbox source port when the application
+must send a reply. This avoids turning a published port into an unrestricted
+egress escape hatch.
+
+Domain traffic rules authorize IPv4 addresses learned from an allowed
+original DNS query, following its complete CNAME chain. The authorization
+uses the answer TTL, clamped to 1..3600 seconds, and is replaced when the name
+is resolved again with an IPv4 A or ANY query. Existing connections that
+depended on an expired or replaced authorization are removed. Parallel AAAA
+queries do not revoke IPv4 grants. DNS names not covered by a domain traffic
+rule can still resolve when the DNS policy allows the query, but their answers
+do not grant packet access. While a DNS policy or domain traffic rule is
+active, ordinary TCP and UDP DNS is accepted only through sandboxd's managed
+resolver; a traffic rule for another port-53 resolver does not bypass it.
+The resulting enforcement is at IPv4 and transport layers. Another virtual
+host sharing an authorized address and port is not distinguishable; use an
+application proxy when hostname-level isolation is required.
+
+Network policy replacement uses whole-policy semantics. The legacy
+`block_network` and `dns_blacklist` fields cannot be combined with schema v2
+sections. DNS policies cover ordinary UDP and TCP DNS and return a refused
+response for denied queries; DNS-over-HTTPS and connections to a known IP are
+outside DNS filtering. Packet rules are IPv4. sandboxd accepts 256 combined
+traffic rules; the backend reserves entries from that limit for the Function
+Proxy and each distinct published sandbox port. IPv6 traffic is dropped
+whenever a traffic or DNS policy is active, preventing an alternate resolver
+from bypassing the IPv4 policy. Arbitrary non-IP Ethernet protocols are
+outside the portable ACL contract. Domain and DNS patterns are normalized
+through IDNA.
+
+See [`examples/network_policy.py`](./examples/network_policy.py) for the
+compatibility modes and generic allowlist. Deployment nodes must have network
+ACL support enabled; the bundled standalone, Helm, and Terraform
+configurations enable it. Drain existing sandboxes before upgrading a node to
+an ACL-enabled sandboxd configuration, as described in the
+[deployment guide](../../deploy/README.md#network-acls).
+
+## Sandbox runtimes
+
+AKernel uses the gVisor `runsc` runtime when `runtime` is omitted. Runtime
+identifiers and optional `extra_config` are forwarded to the selected backend
+instead of being restricted or interpreted by an SDK-owned registry. Values in
+`extra_config` must be JSON-compatible. The bundled deployment advertises
+`runsc`, Kata Containers, and Firecracker by default when their host
+prerequisites are available.
+
+Kata and Firecracker require at least one cluster node whose sandboxd instance
+successfully initialized the requested runtime with a usable `/dev/kvm`
+device. Nodes without KVM remain available for runsc workloads and do not
+advertise either VM runtime. The bundled Firecracker configuration enables
+read-only virtio-fs for OCI/Nydus image roots and read-only host directories,
+while retaining EROFS image roots and mounts. OCI image mounts, writable host
+binds, GPUs, and nested KVM remain unsupported.
+
+The all-in-one image can optionally package a native Linux `runc` backend.
+Operators build it with `AKERNEL_ENABLE_RUNC=true` and enable it explicitly
+because it provides host-kernel container isolation, not the user-space kernel
+boundary of runsc. Guided cloud profiles use
+`make config ENABLE_RUNC=true`; standalone deployments use
+`AKERNEL_ENABLE_RUNC=true`, and direct Helm deployments use
+`node.config.sandboxd.enableRunc=true`. After it is advertised:
+
+```python
+with Sandbox(runtime="runc") as sandbox:
+    print(sandbox.commands.run("uname -s").stdout)
+
+with Sandbox(
+    runtime="runc",
+    extra_config={"enableKVM": True},
+) as sandbox_with_kvm:
+    print(sandbox_with_kvm.commands.run("test -c /dev/kvm").exit_code)
+```
+
+`enableKVM` is owned by the runc backend and requires a usable `/dev/kvm` on
+the selected node. Runc supports OCI/EROFS root filesystems, read-only mounts,
+networking, command execution, and the default writable overlay. Experimental
+GPU requests remain runsc-only; explicit `storage_mb` quotas are supported by
+runsc and Firecracker. See the
+[sandbox runtime comparison](../../src/sandboxd/doc/runtime.md) for the
+runtime capability boundaries.
 
 See [`examples/sandbox_runtime.py`](./examples/sandbox_runtime.py) for a runnable example.
 
@@ -163,7 +358,9 @@ handle.close_stdin()
 result = handle.wait(timeout=15)
 ```
 
-Foreground commands use one actor RPC with the configured timeout. Background commands return a handle whose `wait()` method also performs one actor RPC.
+Foreground commands return a backend-neutral `CommandResult`. Background
+commands return an AKernel `CommandHandle`; its lifecycle operations are
+delegated to the selected backend.
 
 ## Filesystem
 
@@ -236,6 +433,37 @@ with Sandbox(port_forwardings=[8080]) as sandbox:
 deployment operator explicitly wants the direct Traefik address instead of the
 public gateway.
 
+## Local failover and reload
+
+`Sandbox(failover=True)` opts into same-node recovery of the same logical
+sandbox after its physical runtime fails. `sandbox.reload()` requests the same
+rollback explicitly. It returns `False` whenever the rollback is not completed,
+including when no usable local anonymous checkpoint exists, the sandbox is
+already closed, or the backend reports an operational failure. A successful
+reload preserves `sandbox.id` and the existing commands, filesystem, and PTY
+facades.
+
+Recovery points are local and follow the source sandbox lifecycle. They are
+created by sandbox workloads through RRT's internal `POST /checkpoint`
+endpoint on `/run/akernel/rrt.sock`. A successful request returns
+`{"status":"completed"}`; a concurrent checkpoint request returns HTTP 409.
+This Unix-socket protocol is experimental and is not a stable public AKernel
+SDK interface. The SDK deliberately does not expose checkpoint identifiers,
+restore, list, or delete operations.
+
+The bundled runsc and Firecracker runtimes support this recovery flow. The
+maintained example validates it with runsc and installs curl in the sandbox
+before calling the internal Unix-socket endpoint, so the default RRT runtime
+profile is sufficient:
+
+```bash
+AKERNEL_TEST_RUNTIME=runsc python examples/failover_reload.py
+```
+
+See [`examples/failover_reload.py`](./examples/failover_reload.py) for the
+internal trigger used during integration. The actor-based
+`openyuanrong-sdk` backend does not support failover or reload.
+
 ## Reverse tunnels
 
 A reverse tunnel lets sandbox code call an HTTP or HTTPS service reachable
@@ -264,8 +492,14 @@ the loopback HTTP listener used inside the sandbox. Consequently,
 
 For an HTTPS target, the SDK-side tunnel client performs the TLS handshake and
 certificate verification. The sandbox application talks only to its loopback
-HTTP listener. AKernel 0.1.0 supports one HTTP/WebSocket reverse tunnel per
-sandbox; it does not expose a general TCP tunnel.
+HTTP listener. AKernel supports one HTTP/HTTPS reverse tunnel per sandbox and
+does not expose a general TCP tunnel.
+
+The default `openyuanrong-sandbox` backend supports custom internal tunnel
+ports. Its frontend derives the WebSocket port from the HTTP listener, so
+`reverse_port` must equal `listen_port - 1`. Both ports are reserved inside
+that sandbox while the tunnel is active and must not also appear in
+`port_forwardings`; they do not occupy ports on the SDK host.
 
 ## Rootfs and mounts
 
@@ -274,6 +508,36 @@ Use a public OCI image:
 ```python
 with Sandbox(image="ubuntu:24.04") as sandbox:
     print(sandbox.commands.run("cat /etc/os-release").stdout)
+```
+
+To start the effective OCI image `ENTRYPOINT` and `CMD` as the managed sandbox
+workload, enable entrypoint inheritance and wait for its exit status:
+
+```python
+with Sandbox(image="example/worker:latest", inherit_entrypoint=True) as sandbox:
+    exit_code = sandbox.wait_entrypoint()
+    print(exit_code, sandbox.entrypoint_exit_info)
+```
+
+For this image-inheritance path, `sandbox.startup_command` is `None`.
+`wait_entrypoint()` returns an integer exit code; `entrypoint_exit_info`
+contains the structured exit details collected by that call. Waiting observes
+process exit, not application readiness. An inherited process exiting after
+successful sandbox creation does not by itself terminate the sandbox.
+For a long-running service, check its application health endpoint separately.
+
+`Sandbox(cwd=...)` sets the default working directory for subsequent
+`sandbox.commands.run()` calls that omit `cwd`. With `inherit_entrypoint=True`,
+the image process starts in the image's OCI `WORKDIR`; the constructor's
+`cwd` does not override it. For example, if the image declares `WORKDIR /app`:
+
+```python
+with Sandbox(
+    image="example/worker:latest", inherit_entrypoint=True, cwd="/tmp"
+) as sandbox:
+    # The inherited image entrypoint starts in /app.
+    print(sandbox.commands.run("pwd").stdout)  # /tmp
+    print(sandbox.commands.run("pwd", cwd="/").stdout)  # /
 ```
 
 Or use an object in S3-compatible storage as the rootfs:
@@ -295,7 +559,19 @@ with Sandbox(rootfs=rootfs) as sandbox:
 
 `image` and `rootfs` are mutually exclusive. The SDK generates the backend
 wire representation; callers do not pass raw rootfs JSON or override the
-runtime inside an S3 object.
+runtime inside an S3 object. When neither source is supplied, AKernel sends
+only the selected isolation runtime and openYuanRong overlays it onto the
+rootfs configured by the deployed service.
+
+Firecracker supports `Sandbox(runtime="firecracker", image="ubuntu:24.04")`
+with the bundled virtio-fs configuration. Both OCI and Nydus roots use the
+image manager's directory directly, without conversion to EROFS. The shared
+root stays read-only; sandbox writes use its private ext4 overlay. The deployed
+default and explicit `rootfs` S3 objects continue to use raw EROFS images.
+The bundled distill-fs supports Nydus RAFS v5. When preparing Nydus images with
+`nydusify convert`, select `--fs-version 5` explicitly.
+Custom deployments must enable `plugin.runtime.firecracker.virtiofs_enabled`
+and install the matching Firecracker stack and virtiofsd.
 
 The same `S3Config` type can be used as a read-only mount source:
 
@@ -312,6 +588,50 @@ OCI images can also be mounted read-only:
 ```python
 mount = Mount(target="/opt/tools", image_url="ubuntu:24.04")
 ```
+
+Firecracker mounts must instead use `type="erofs"` with an S3 object containing
+a raw EROFS image; it rejects `image_url` and directory-backed mounts.
+
+## Launch from a Dockerfile
+
+Dockerfile direct launch is a supported AKernel SDK capability and will remain
+available. Its documented strict subset evolves incrementally with production
+experience; unsupported inputs continue to fail closed. The specific API surface
+may evolve, with documentation and migration guidance for material changes. It
+is not a general-purpose Docker build.
+
+`FROM` supplies only the root filesystem; inherited OCI configuration is not
+applied. Precheck the context, then pass its launch configuration to `Sandbox`:
+
+```python
+from akernel_sdk import DockerfileLaunch, LocalDockerContext, Sandbox, check_direct_launch
+context = LocalDockerContext("Dockerfile", context_dir=".")
+if check_direct_launch(context).direct_launchable:
+    with Sandbox(dockerfile=DockerfileLaunch(context, run_timeout=300)) as sandbox:
+        startup = sandbox.startup_command
+        if startup is not None:
+            # For a finite CMD/ENTRYPOINT, collect its exit code and output.
+            result = startup.wait(timeout=60)
+            print(result.exit_code, result.stdout, result.stderr)
+```
+
+`startup_command` is a `CommandHandle` for the Dockerfile's background
+`CMD`/`ENTRYPOINT`. It is `None` when `auto_start_cmd=False` or no startup
+command is declared. The handle supports `wait(timeout=...)` and `kill()`;
+construction confirms dispatch, while application readiness requires a
+separate health check. For long-running services, perform that check instead
+of waiting for exit during startup.
+
+`wait_entrypoint()` is exclusive to image launches with
+`inherit_entrypoint=True`; calling it on a Dockerfile launch raises
+`RuntimeError`, and `entrypoint_exit_info` is `None`. See the
+[image launch examples](#rootfs-and-mounts) for that path.
+
+`RUN`, `COPY`, and `ADD` run on every launch without a snapshot or cache;
+unsupported Dockerfiles must be built externally. Read the complete contract,
+security boundaries, and supported syntax in
+[the Dockerfile launch guide](./docs/launch-from-dockerfile.md). See the
+[runnable example](./examples/dockerfile_launch.py).
 
 ## Resources and lifecycle
 
@@ -364,8 +684,11 @@ Maintained examples are under [`examples/`](./examples):
 - `basic_usage.py`
 - `command_stdin.py`
 - `custom_image.py`
+- `dockerfile_launch.py`
+- `failover_reload.py`
 - `gpu_sandbox.py`
 - `named_sandbox.py`
+- `network_policy.py`
 - `pty.py`
 - `port_forwarding.py`
 - `reverse_tunnel.py`
@@ -387,6 +710,14 @@ PYTHONPATH=sdk/python \
   python -m unittest discover -s sdk/python/tests/integration -t sdk/python -v
 ```
 
+Set `AKERNEL_TEST_RUNTIME=firecracker` and `AKERNEL_TEST_IMAGE=ubuntu:24.04`
+to exercise the same suite, including checkpoint/reload, against a virtio-fs
+image root. `AKERNEL_TEST_IMAGE` also accepts a Nydus image reference and
+enables a check that writes stay private to each sandbox sharing the image.
+The test image must provide an Ubuntu/Debian userspace with `apt-get` for the
+checkpoint test's curl and CA certificate installation. Omit
+`AKERNEL_TEST_IMAGE` to test the deployed default EROFS root.
+
 Load and transfer benchmarks live under [`benchmarks/`](./benchmarks) and are
 not part of the default test suite.
 
@@ -397,8 +728,18 @@ not part of the default test suite.
 | `CommandResult` | `stdout`, `stderr`, `exit_code` |
 | `CommandInfo` | `pid`, `command`, `running` |
 | `EntryInfo` | `name`, `path`, `type`, `size`, `permissions`, `modified_time` |
-| `SandboxInfo` | `id`, `state`, `cpu`, `memory`, `image` |
+| `SandboxInfo` | `id`, `state`, `cpu`, `memory`, `image`, `xpu`, `storage_mb` |
 | `NodeInfo` | `id`, `status`, `capacity`, `allocatable`, `labels` |
 | `S3Config` | `endpoint`, `bucket`, `object`, optional credentials |
 | `Mount` | `target`, one source, and `type` |
 | `HttpReverseTunnel` | `target`, `reverse_port`, `listen_port`, `connect_timeout` |
+| `PortRange` | `first`, `last` |
+| `NetworkRule` | action, direction, protocol, peer and sandbox port selectors, priority |
+| `TrafficPolicy` | independent ingress/egress defaults, rules, mode |
+| `DNSRule` | `pattern`, `action` |
+| `DNSPolicy` | `default_action`, `rules` |
+| `NetworkPolicy` | legacy fields or schema v2 `traffic` and `dns` sections |
+| `DockerfileLaunch` | `context`, `auto_start_cmd`, `run_timeout` |
+| `DockerContext` | Abstract Dockerfile and build-context source |
+| `DockerContextEntry` | `path`, `kind`, `mode` |
+| `LocalDockerContext` | Local Dockerfile and context implementation |

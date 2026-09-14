@@ -12,7 +12,38 @@ Keeping the gateway in a separate network namespace allows sandboxd's normal
 traffic from the node network namespace, so the standalone sandboxd config
 also enables its local-output DNAT support.
 
-The default runtime is gVisor `runsc`. `Sandbox(runtime="kata")` additionally requires `/dev/kvm` and hardware or nested virtualization on the Docker host. Nodes without KVM remain usable with runsc and do not advertise Kata to the scheduler.
+The default runtime is gVisor `runsc`. The bundled image also contains Kata
+Containers and Firecracker. Both `Sandbox(runtime="kata")` and
+`Sandbox(runtime="firecracker")` require `/dev/kvm` plus hardware or nested
+virtualization on the Docker host. Nodes without KVM remain usable with runsc
+and do not advertise either VM runtime to the scheduler.
+
+Firecracker enables read-only virtio-fs by default, so
+`Sandbox(runtime="firecracker", image="ubuntu:24.04")` can use OCI or Nydus
+roots directly. The image includes a pinned virtiofsd and matching VMM,
+kernel, and guest agent. Its private writable disk uses `AsyncDirect` and
+`Writeback`; the host must support io_uring and `STATX_DIOALIGN` on the
+filestore filesystem. See the [deployment guide](../README.md) for older-host
+configuration and checkpoint compatibility when upgrading the runtime stack.
+
+See the maintained
+[runtime selection example](../../sdk/python/examples/sandbox_runtime.py) for
+client usage.
+
+Default image builds exclude the optional native Linux `runc` runtime, and
+standalone does not advertise it by default. Build an image containing the
+payload, then enable it when host-kernel container isolation is appropriate:
+
+```bash
+AKERNEL_ENABLE_RUNC=true make build \
+  IMAGE_REPOSITORY=akernel-runc IMAGE_TAG=local
+
+IMAGE=akernel-runc:local AKERNEL_ENABLE_RUNC=true ./start.sh
+```
+
+Clients then select it with `Sandbox(runtime="runc")`. A sandbox may request
+the configured KVM character device with
+`extra_config={"enableKVM": True}` when the host exposes `/dev/kvm`.
 
 Experimental NVIDIA GPU sandboxes use gVisor nvproxy. The host must provide a
 compatible NVIDIA driver and NVIDIA Container Toolkit. Enable GPU access to
@@ -26,11 +57,59 @@ The all-in-one image contains `nvidia-container-cli`, but not the host driver.
 Use `AKERNEL_GPU_DEVICES` to override Docker's `--gpus` value when only a
 device subset should be assigned.
 
-Explicit sandbox storage quotas use the XFS filestore mounted at
-`/home/akernel/xfs`. The standalone data directory is bind-mounted from the
-host, and sandboxd creates `data/xfs.img` as a loop-backed XFS filesystem when
-needed; quota-backed writable layers therefore use local disk rather than
-tmpfs.
+Explicit sandbox storage quotas for runsc and Firecracker use the bounded ext4
+filestore mounted at `/home/akernel/filestore`. The standalone data directory
+is bind-mounted from the host, and sandboxd creates a loop-backed filesystem
+image there when needed; quota-backed writable layers therefore use local disk
+rather than tmpfs. Without `storage_mb`, runsc retains its configured
+memory-backed overlay while Firecracker uses its configured sparse ext4
+default.
+
+Sandbox checkpoints for runsc and Firecracker use YuanRong's local-only
+snapshot mode. Checkpoint state is kept under the persistent
+`/home/akernel/checkpoints` data mount. Workloads trigger an anonymous recovery
+point through `POST /checkpoint` on `/run/akernel/rrt.sock`, and the SDK can
+reload the same logical sandbox from the latest usable point. Recovery points
+follow the source sandbox lifecycle; they are not exposed as reusable SDK
+objects.
+
+`start.sh` loads the host `tun` module and verifies `/dev/net/tun` before
+starting the pooled-TAP runtimes. Runc retains its separate veth network path.
+
+### Network backend
+
+Standalone uses the iptables NAT backend by default. Nodes without the
+required iptables NAT and conntrack kernel modules can select the experimental
+embedded TC eBPF backend:
+
+```bash
+AKERNEL_NAT_BACKEND=bpfnat ./start.sh
+```
+
+The node container remains privileged and must be able to load TC eBPF
+programs and mount or access bpffs. AKernel enables IPv4 forwarding before
+sandboxd starts and disables global reverse-path filtering inside the node
+network namespace when bpfnat local DNAT is enabled. bpfnat replaces NAT; it
+does not override firewall policy. A custom host-network deployment whose
+`FORWARD` policy is `DROP` must allow traffic to and from `sandbox0` with
+bridge- and sandbox-CIDR-scoped rules.
+
+AKernel passes YuanRong the IPv4 address of the default-route interface so the
+later creation of `sandbox0` cannot change the advertised node address. Set
+`AKERNEL_NODE_IP` only when a multi-homed deployment requires an explicit
+override.
+
+The standalone configuration enables per-sandbox network ACLs. With the
+default iptables backend, `start.sh` loads IPv6 filter-table, `br_netfilter`,
+`xt_physdev`, conntrack/connmark, and timeout-capable ipset modules on the host
+before the node starts; the node then enables IPv4 and IPv6 bridge netfilter in
+its own network namespace.
+The optional bpfnat backend instead
+requires TC eBPF support and a writable bpffs. TCP and UDP port 53 on the
+sandbox bridge must remain free for sandboxd's managed DNS proxy. Before
+upgrading an existing standalone data directory to an ACL-enabled image,
+terminate its sandboxes and stop the old node cleanly; sandboxd refuses to
+initialize ACLs while pre-ACL sandboxes remain in its store.
 
 ## Directory Structure
 
@@ -96,7 +175,11 @@ This will:
 - Start the privileged AKernel all-in-one container
 - Start an independent Traefik container for the HTTPS API and HTTP sandbox
   port-forwarding gateway
+- Configure Traefik to poll FunctionMaster's HTTP provider for per-sandbox
+  tunnel routes, including custom tunnel ports
 - Generate a deployment-specific IAM signing seed and a 24-hour SDK token
+- Generate a sandboxd config using `AKERNEL_NAT_BACKEND` (`iptables` by
+  default)
 - Print the Traefik container IP to use as `AKERNEL_SERVER_ADDRESS`
 
 No host ports are published. On Linux, the host accesses Traefik directly

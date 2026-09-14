@@ -8,10 +8,10 @@ VENDOR ?= aliyun
 ENV ?= default
 IMAGE_TAG ?=
 IMAGE_REPOSITORY ?=
-GVISOR_RELEASE ?=
-GVISOR_RELEASE_BASE_URL ?=
 OPEN_YR_CORE_WHEEL_URL ?=
 OPEN_YR_CORE_WHEEL_SHA256 ?=
+RRT_RUNTIME_URL ?=
+RRT_RUNTIME_SHA256 ?=
 TOKEN_TTL ?= $(if $(TTL),$(TTL),24h)
 TENANT ?= default
 ROLE ?= developer
@@ -31,6 +31,7 @@ ACR_NAMESPACE ?=
 MONITOR_STORAGE_CLASS ?=
 INSTALL_MONITOR ?=
 INSTALL_DRAGONFLY ?=
+ENABLE_RUNC ?=
 GRAFANA_PUBLIC_ACCESS ?=
 GRAFANA_ADMIN_PASSWORD ?=
 IAM_SEED_HEX ?=
@@ -47,8 +48,13 @@ help:
 	@echo "  make config FORCE=1                Overwrite an existing config without prompting"
 	@echo "  make config NON_INTERACTIVE=1 ...  Generate config from Make variables"
 	@echo "  make config INSTALL_DRAGONFLY=true Enable optional P2P image distribution"
+	@echo "  make config ENABLE_RUNC=true       Build and register the optional runc runtime"
 	@echo "  make build IMAGE_TAG=<tag>          Build the all-in-one image"
-	@echo "  make build GVISOR_RELEASE=<tag>     Override the pinned official gVisor tag"
+	@echo "  make build RUNTIME_PROFILE=python   Include optional Python runtimes"
+	@echo "  make build AKERNEL_ENABLE_KATA=false Exclude the optional Kata payload"
+	@echo "  make build AKERNEL_ENABLE_FIRECRACKER=false Exclude Firecracker"
+	@echo "  make build AKERNEL_ENABLE_RUNC=true Include the optional runc payload"
+	@echo "  make build RRT_RUNTIME_URL=... RRT_RUNTIME_SHA256=... Override RRT artifact"
 	@echo "  make versions                       Show locally selected component versions"
 	@echo "  make push                          Push the configured all-in-one image"
 	@echo "  make plan                          Terraform plan"
@@ -62,13 +68,11 @@ help:
 
 .PHONY: check
 check:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	./deploy/scripts/check-prereqs.sh --vendor "$(VENDOR)"
+	@./deploy/scripts/check-prereqs.sh --vendor "$(VENDOR)"
 
 .PHONY: config
 config:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	args=(--vendor "$(VENDOR)" --env "$(ENV)"); \
+	@args=(--vendor "$(VENDOR)" --env "$(ENV)"); \
 	if [[ "$(FORCE)" == "1" ]]; then args+=(--force); fi; \
 	if [[ "$(NON_INTERACTIVE)" == "1" ]]; then args+=(--non-interactive); fi; \
 	if [[ -n "$(REGION)" ]]; then args+=(--region "$(REGION)"); fi; \
@@ -87,6 +91,7 @@ config:
 	if [[ -n "$(IMAGE_TAG)" ]]; then args+=(--image-tag "$(IMAGE_TAG)"); fi; \
 	if [[ -n "$(INSTALL_MONITOR)" ]]; then args+=(--install-monitor "$(INSTALL_MONITOR)"); fi; \
 	if [[ -n "$(INSTALL_DRAGONFLY)" ]]; then args+=(--install-dragonfly "$(INSTALL_DRAGONFLY)"); fi; \
+	if [[ -n "$(ENABLE_RUNC)" ]]; then args+=(--enable-runc "$(ENABLE_RUNC)"); fi; \
 	if [[ -n "$(GRAFANA_PUBLIC_ACCESS)" ]]; then args+=(--grafana-public-access "$(GRAFANA_PUBLIC_ACCESS)"); fi; \
 	if [[ -n "$(GRAFANA_ADMIN_PASSWORD)" ]]; then args+=(--grafana-admin-password "$(GRAFANA_ADMIN_PASSWORD)"); fi; \
 	if [[ -n "$(IAM_SEED_HEX)" ]]; then args+=(--iam-seed-hex "$(IAM_SEED_HEX)"); fi; \
@@ -94,40 +99,35 @@ config:
 
 .PHONY: build
 build:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	args=(--env "$(ENV)"); \
+	@args=(--env "$(ENV)"); \
 	if [[ -n "$(IMAGE_REPOSITORY)" ]]; then args+=(--repository "$(IMAGE_REPOSITORY)"); fi; \
 	if [[ -n "$(IMAGE_TAG)" ]]; then args+=(--tag "$(IMAGE_TAG)"); fi; \
-	if [[ -n "$(GVISOR_RELEASE)" ]]; then args+=(--gvisor-release "$(GVISOR_RELEASE)"); fi; \
-	if [[ -n "$(GVISOR_RELEASE_BASE_URL)" ]]; then args+=(--gvisor-release-base-url "$(GVISOR_RELEASE_BASE_URL)"); fi; \
+	if [[ -n "$(RUNTIME_PROFILE)" ]]; then args+=(--runtime-profile "$(RUNTIME_PROFILE)"); fi; \
 	if [[ -n "$(OPEN_YR_CORE_WHEEL_URL)" ]]; then args+=(--open-yr-core-wheel-url "$(OPEN_YR_CORE_WHEEL_URL)"); fi; \
 	if [[ -n "$(OPEN_YR_CORE_WHEEL_SHA256)" ]]; then args+=(--open-yr-core-wheel-sha256 "$(OPEN_YR_CORE_WHEEL_SHA256)"); fi; \
+	if [[ -n "$(RRT_RUNTIME_URL)" ]]; then args+=(--rrt-runtime-url "$(RRT_RUNTIME_URL)"); fi; \
+	if [[ -n "$(RRT_RUNTIME_SHA256)" ]]; then args+=(--rrt-runtime-sha256 "$(RRT_RUNTIME_SHA256)"); fi; \
 	./deploy/scripts/build-image.sh "$${args[@]}"
 
 .PHONY: versions
 versions:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	./deploy/scripts/build-image.sh --print-component-versions
+	@./deploy/scripts/build-image.sh --print-component-versions
 
 .PHONY: push
 push:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	./deploy/scripts/push-image.sh --vendor "$(VENDOR)" --env "$(ENV)"
+	@./deploy/scripts/push-image.sh --vendor "$(VENDOR)" --env "$(ENV)"
 
 .PHONY: plan
 plan:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	./deploy/scripts/deploy.sh --vendor "$(VENDOR)" --env "$(ENV)" --plan
+	@./deploy/scripts/deploy.sh --vendor "$(VENDOR)" --env "$(ENV)" --plan
 
 .PHONY: deploy
 deploy:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	./deploy/scripts/deploy.sh --vendor "$(VENDOR)" --env "$(ENV)" --apply
+	@./deploy/scripts/deploy.sh --vendor "$(VENDOR)" --env "$(ENV)" --apply
 
 .PHONY: token
 token:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	./deploy/scripts/generate-token.py \
+	@./deploy/scripts/generate-token.py \
 		--env "$(ENV)" \
 		--tenant "$(TENANT)" \
 		--role "$(ROLE)" \
@@ -137,31 +137,27 @@ token:
 
 .PHONY: print-env
 print-env:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	./deploy/scripts/print-sdk-env.sh --vendor "$(VENDOR)" --env "$(ENV)"
+	@./deploy/scripts/print-sdk-env.sh --vendor "$(VENDOR)" --env "$(ENV)"
 
 .PHONY: e2e
 e2e:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	./deploy/scripts/run-e2e.sh --env "$(ENV)"
+	@./deploy/scripts/run-e2e.sh --env "$(ENV)"
 
 .PHONY: sdk-test
 sdk-test:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; \
-	PYTHONPATH=sdk/python python3 -m unittest discover \
+	@PYTHONPATH=sdk/python python3 -m unittest discover \
 		-s sdk/python/tests/unit -t sdk/python -v
 
 .PHONY: sdk-check
 sdk-check: sdk-test
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; \
+	@set -e; \
 	cd sdk/python; \
 	python3 -m ruff check akernel_sdk tests; \
 	python3 -m mypy akernel_sdk
 
 .PHONY: deploy-script-check
 deploy-script-check:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; \
-	set -euo pipefail; \
+	@set -euo pipefail; \
 	while IFS= read -r -d '' script; do \
 		bash -n "$$script"; \
 	done < <(git ls-files -z -- 'deploy/**/*.sh'); \
@@ -182,7 +178,6 @@ deploy-script-check:
 
 .PHONY: destroy
 destroy:
-	@unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
-	args=(--vendor "$(VENDOR)" --env "$(ENV)"); \
+	@args=(--vendor "$(VENDOR)" --env "$(ENV)"); \
 	if [[ "$(AUTO_APPROVE)" == "1" ]]; then args+=(--yes); fi; \
 	./deploy/scripts/destroy.sh "$${args[@]}"

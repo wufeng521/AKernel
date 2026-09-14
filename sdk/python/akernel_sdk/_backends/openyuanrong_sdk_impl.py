@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Internal openYuanrong adapter used by the public AKernel SDK."""
+"""Backend-specific implementation helpers for ``openyuanrong-sdk``.
+
+This module owns the actor SDK lifecycle, option translation, actor operations,
+resource conversion, and reverse-tunnel integration used by the backend adapter.
+"""
 
 from __future__ import annotations
 
-import atexit
 import json
 import logging
 import os
@@ -28,21 +31,26 @@ import yr
 from yr.runtime_holder import global_runtime
 from yr.sandbox.sandbox import _sanitize_instance_id
 
-from ._addresses import api_endpoint_from_env, gateway_endpoint_from_env
-from ._instance import _SandboxInstance
-from ._resource_api import parse_resource_nodes, query_resource_view
-from ._sandbox_resources import (
+from .._addresses import api_endpoint_from_env, gateway_endpoint_from_env
+from .._instance import _SandboxInstance
+from .._resource_api import parse_resource_nodes, query_resource_view
+from .._sandbox_resources import (
     normalize_xpu,
     storage_bytes,
     validate_storage_mb,
     xpu_custom_resource,
 )
-from .types import HttpReverseTunnel, Mount, NodeInfo, S3Config
+from ..types import (
+    HttpReverseTunnel,
+    Mount,
+    NetworkPolicy,
+    NodeInfo,
+    S3Config,
+)
 
 logger = logging.getLogger(__name__)
 
 _NAMESPACE = "akernel"
-_DEFAULT_LOCAL_ROOTFS = "/home/yuanrong/yr-runtime-rootfs.img"
 _initialized = False
 _init_lock = threading.Lock()
 
@@ -81,8 +89,17 @@ def ensure_initialized() -> None:
                 bypass_datasystem=True,
             )
         )
-        atexit.register(yr.finalize)
         _initialized = True
+
+
+def finalize() -> None:
+    """Release process-level openYuanrong SDK resources."""
+
+    global _initialized
+    if not _initialized:
+        return
+    yr.finalize()
+    _initialized = False
 
 
 def _validate_positive_int(name: str, value: int, *, allow_zero: bool = False) -> None:
@@ -115,16 +132,7 @@ def _rootfs_json(
                 "storageInfo": rootfs.to_dict(),
             }
         )
-    if runtime != "runsc":
-        return json.dumps(
-            {
-                "runtime": runtime,
-                "type": "local",
-                "readonly": False,
-                "path": _DEFAULT_LOCAL_ROOTFS,
-            }
-        )
-    return None
+    return json.dumps({"runtime": runtime})
 
 
 def build_options(
@@ -147,6 +155,8 @@ def build_options(
     node_id: str | None,
     xpu: str | None,
     storage_mb: int | None,
+    network_policy: NetworkPolicy | None,
+    extra_config: Mapping[str, object],
 ) -> Any:
     """Translate the stable SDK configuration to openYuanrong options."""
 
@@ -155,27 +165,20 @@ def build_options(
     _validate_positive_int("cpu_limit", cpu_limit, allow_zero=True)
     _validate_positive_int("mem_limit", mem_limit, allow_zero=True)
     _validate_positive_int("idle_timeout", idle_timeout, allow_zero=True)
-    if schedule_timeout != -1:
-        _validate_positive_int("schedule_timeout", schedule_timeout, allow_zero=True)
+    _validate_positive_int("schedule_timeout", schedule_timeout)
     if cpu_limit and cpu_limit < cpu:
         raise ValueError("cpu_limit must be 0 or greater than or equal to cpu")
     if mem_limit and mem_limit < memory:
         raise ValueError("mem_limit must be 0 or greater than or equal to memory")
     normalized_xpu = normalize_xpu(xpu)
     validate_storage_mb(storage_mb)
-    if normalized_xpu is not None and runtime != "runsc":
-        raise ValueError("xpu is currently supported only by runsc")
-    if storage_mb is not None and runtime != "runsc":
-        raise ValueError("storage_mb is currently supported only by runsc")
 
     options = yr.InvokeOptions()
     # A Sandbox is driven by one sequential SDK client. Disabling ordered RPC
     # execution prevents a missing sequence number from stalling later calls.
     options.need_order = False
     options.idle_timeout = idle_timeout
-    options.schedule_timeout_ms = (
-        -1 if schedule_timeout == -1 else schedule_timeout * 1000
-    )
+    options.schedule_timeout_ms = schedule_timeout * 1000
     options.cpu = cpu
     options.memory = memory
     options.cpu_limit = cpu_limit
@@ -200,6 +203,12 @@ def build_options(
         options.custom_resources[resource_name] = count
     if storage_mb is not None:
         options.custom_resources["storage"] = storage_bytes(storage_mb)
+    if network_policy is not None:
+        options.custom_extensions["network_policy"] = json.dumps(
+            network_policy.to_dict()
+        )
+    if extra_config:
+        options.custom_extensions["extra_config"] = json.dumps(dict(extra_config))
 
     forwarded = list(port_forwardings)
     if reverse_tunnel is not None:
@@ -233,7 +242,17 @@ def build_options(
 def create_instance(options: Any, *, cwd: str | None) -> Any:
     instance_class: Any = _SandboxInstance
     handle = instance_class.options(options).invoke(cwd=cwd)
-    yr.get(handle.ping.invoke())
+    try:
+        yr.get(handle.ping.invoke())
+    except Exception:
+        try:
+            terminate_instance(handle)
+        except Exception:
+            logger.warning(
+                "failed to roll back an actor after its readiness check failed",
+                exc_info=True,
+            )
+        raise
     return handle
 
 

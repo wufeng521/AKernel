@@ -5,7 +5,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=common.sh
@@ -31,6 +30,7 @@ image_repository_override=""
 image_tag_override=""
 install_monitor_override=""
 install_dragonfly_override=""
+enable_runc_override=""
 grafana_public_access_override=""
 grafana_admin_password_override=""
 iam_seed_hex_override=""
@@ -115,6 +115,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --install-dragonfly)
       install_dragonfly_override="$2"
+      shift 2
+      ;;
+    --enable-runc)
+      enable_runc_override="$2"
       shift 2
       ;;
     --grafana-public-access)
@@ -216,6 +220,7 @@ esac
 set_or_prompt image_tag "All-in-one image tag" "${default_tag}" "${image_tag_override}"
 set_or_prompt install_monitor "Install monitor chart (true/false)" "true" "${install_monitor_override}"
 set_or_prompt install_dragonfly "Install Dragonfly and dedicated node pools (true/false)" "false" "${install_dragonfly_override}"
+set_or_prompt enable_runc "Enable the optional runc runtime (true/false)" "false" "${enable_runc_override}"
 set_or_prompt grafana_public_access "Expose Grafana LoadBalancer (true/false)" "true" "${grafana_public_access_override}"
 set_or_prompt grafana_admin_password \
   "Grafana admin password (empty to generate)" "" \
@@ -225,6 +230,7 @@ if [[ -z "${grafana_admin_password}" ]]; then
 fi
 install_monitor="$(normalize_bool "${install_monitor}")"
 install_dragonfly="$(normalize_bool "${install_dragonfly}")"
+enable_runc="$(normalize_bool "${enable_runc}")"
 grafana_public_access="$(normalize_bool "${grafana_public_access}")"
 
 dir="$(state_dir "${env_name}")"
@@ -306,6 +312,11 @@ node_pool_system_disk_size     = 100
 node_pool_data_disk_enabled    = true
 node_pool_data_disk_category   = "cloud_essd"
 node_pool_data_disk_size       = 100
+node_pool_extra_data_disk_enabled    = true
+node_pool_extra_data_disk_category   = "cloud_essd"
+node_pool_extra_data_disk_size       = 300
+node_pool_extra_data_disk_mount_path = "/home/akernel"
+node_pool_extra_data_disk_fs_type    = "xfs"
 node_pool_key_name             = "${node_pool_key_name}"
 
 core_namespace = "akernel"
@@ -340,6 +351,7 @@ grafana_public_access  = ${grafana_public_access}
 grafana_admin_password = "${grafana_admin_password}"
 
 install_dragonfly = ${install_dragonfly}
+enable_runc       = ${enable_runc}
 EOF
     ;;
   huaweicloud)
@@ -393,6 +405,7 @@ grafana_public_access  = ${grafana_public_access}
 grafana_admin_password = "${grafana_admin_password}"
 
 install_dragonfly = ${install_dragonfly}
+enable_runc       = ${enable_runc}
 EOF
     ;;
 esac
@@ -413,6 +426,7 @@ IMAGE_TAG=${image_tag}
 CORE_NAMESPACE=akernel
 MONITOR_NAMESPACE=akernel-monitor
 INSTALL_DRAGONFLY=${install_dragonfly}
+AKERNEL_ENABLE_RUNC=${enable_runc}
 EOF
 
 chmod 600 "${tfvars_file}" "${config_file}"

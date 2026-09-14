@@ -5,11 +5,53 @@
 # SPDX-License-Identifier: Apache-2.0
 ulimit -n 32768
 export YR_RUNTIME_BACKEND=sandboxd
-# Set enable_traefik_registry based on TRAEFIK_MODE
+export YR_IMAGE_PROCESS_CONFIG="${YR_IMAGE_PROCESS_CONFIG:-/run/akernel/yr-image-process.json}"
+
+resolve_node_ip() {
+    local default_device
+    local node_ip
+
+    if [ -n "${AKERNEL_NODE_IP:-}" ]; then
+        printf '%s\n' "${AKERNEL_NODE_IP}"
+        return
+    fi
+    if [ -n "${INSTANCE_IP:-}" ]; then
+        printf '%s\n' "${INSTANCE_IP}"
+        return
+    fi
+    if ! command -v ip >/dev/null 2>&1; then
+        echo "ip is required to discover the AKernel node address" >&2
+        return 1
+    fi
+
+    default_device="$(ip -4 route show default | awk 'NR == 1 { print $5 }')"
+    if [ -z "${default_device}" ]; then
+        echo "the AKernel network namespace has no IPv4 default route" >&2
+        return 1
+    fi
+    node_ip="$(
+        ip -4 -o address show dev "${default_device}" scope global |
+            awk 'NR == 1 { split($4, address, "/"); print address[1] }'
+    )"
+    if [ -z "${node_ip}" ]; then
+        echo "default-route device ${default_device} has no global IPv4 address" >&2
+        return 1
+    fi
+    printf '%s\n' "${node_ip}"
+}
+
+YR_NODE_IP="$(resolve_node_ip)"
+echo "Using ${YR_NODE_IP} as the YuanRong node address"
+CHECKPOINT_DIR="/home/akernel/checkpoints"
+mkdir -p "${CHECKPOINT_DIR}"
+
+# Select the legacy etcd registry or the FunctionMaster HTTP provider.
 if [ "${TRAEFIK_MODE:-etcd}" = "etcd" ]; then
     ENABLE_TRAEFIK_REGISTRY=${ENABLE_TRAEFIK_REGISTRY:-true}
+    ENABLE_TRAEFIK_PROVIDER=false
 else
     ENABLE_TRAEFIK_REGISTRY=false
+    ENABLE_TRAEFIK_PROVIDER=true
 fi
 
 if [  "x${AKS_LOCAL_MODE}" == "xtrue" ]; then
@@ -22,6 +64,7 @@ if [  "x${AKS_LOCAL_MODE}" == "xtrue" ]; then
         exit 1
     fi
     /usr/bin/yr start --master \
+        --ip_address "${YR_NODE_IP}" \
         --port_policy FIX \
         --enable_function_scheduler=false \
         --enable_faas_frontend=true \
@@ -45,10 +88,12 @@ if [  "x${AKS_LOCAL_MODE}" == "xtrue" ]; then
         --enable_distributed_master false \
         --metrics_collector_type external \
         --enable_traefik_registry=${ENABLE_TRAEFIK_REGISTRY} \
+        --enable_traefik_provider=${ENABLE_TRAEFIK_PROVIDER} \
         --traefik_enable_tls=${TRAEFIK_ENABLE_TLS:-false} \
         --traefik_etcd_prefix=traefik \
         --traefik_lease_ttl=300000 \
         --traefik_http_entrypoint=${TRAEFIK_HTTP_ENTRYPOINT:-websecure} \
+        --traefik_http_entry_point=${TRAEFIK_HTTP_ENTRYPOINT:-websecure} \
         --enable_metrics ${ENABLE_METRICS} \
         --metrics_config_file "/home/yuanrong/metrics/metrics_config.json" \
         --enable_trace ${ENABLE_TRACE} \
@@ -65,10 +110,13 @@ if [  "x${AKS_LOCAL_MODE}" == "xtrue" ]; then
         --iam_local_ip 127.0.0.1 \
         --frontend_lease_bypass true \
         --force_low_reliability_instance true \
+        --snapshot_storage_mode local_only \
+        --checkpoint_dir "${CHECKPOINT_DIR}" \
         --enable_sandbox_router true \
         --enable_direct_routing false
 else
     /usr/bin/yr start \
+        --ip_address "${YR_NODE_IP}" \
         --port_policy FIX \
         --ds_node_timeout_s 30 \
         --ds_client_dead_timeout_s 60 \
@@ -102,5 +150,7 @@ else
         --function_proxy_merge_process_enable true \
         --enable_direct_routing false \
         --force_low_reliability_instance true \
+        --snapshot_storage_mode local_only \
+        --checkpoint_dir "${CHECKPOINT_DIR}" \
         --block true
 fi

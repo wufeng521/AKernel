@@ -19,7 +19,12 @@ import unittest
 from pathlib import Path
 
 import akernel_sdk
-from akernel_sdk import HttpReverseTunnel, Mount, S3Config
+from akernel_sdk import (
+    DockerContextEntry,
+    HttpReverseTunnel,
+    Mount,
+    S3Config,
+)
 
 
 class PublicTypesTest(unittest.TestCase):
@@ -30,11 +35,30 @@ class PublicTypesTest(unittest.TestCase):
         code = """
 import os
 import sys
+from typing import get_type_hints
+
 os.environ.pop('YR_HTTP_CONNECTION_NUM', None)
 import akernel_sdk
 import akernel_sdk.cli
 assert 'yr' not in sys.modules
+assert 'yr_sandbox' not in sys.modules
 assert 'YR_HTTP_CONNECTION_NUM' not in os.environ
+assert 'akernel_sdk._dockerfile' not in sys.modules
+from akernel_sdk import DockerfileLaunch, Sandbox
+assert 'akernel_sdk._dockerfile_launch' in sys.modules
+assert 'akernel_sdk._dockercontext' in sys.modules
+assert 'akernel_sdk._dockerfile' not in sys.modules
+assert 'dockerfile_parse' not in sys.modules
+assert 'yr' not in sys.modules
+assert 'yr_sandbox' not in sys.modules
+assert 'akernel_sdk._backends.openyuanrong_sandbox' not in sys.modules
+assert 'akernel_sdk._backends.openyuanrong_sdk' not in sys.modules
+assert 'akernel_sdk._backends.openyuanrong_sdk_impl' not in sys.modules
+assert get_type_hints(Sandbox.__init__)['dockerfile'] == DockerfileLaunch | None
+from akernel_sdk._dockerfile import DockerfileLaunch as CompatDockerfileLaunch
+assert CompatDockerfileLaunch is DockerfileLaunch
+from akernel_sdk._dockerfile_runner import apply_dockerfile
+assert get_type_hints(apply_dockerfile)['sb'] is Sandbox
 """
         result = subprocess.run(
             [sys.executable, "-c", code],
@@ -52,6 +76,12 @@ assert 'YR_HTTP_CONNECTION_NUM' not in os.environ
                 "Sandbox",
                 "S3Config",
                 "Mount",
+                "NetworkPolicy",
+                "NetworkRule",
+                "PortRange",
+                "TrafficPolicy",
+                "DNSPolicy",
+                "DNSRule",
                 "HttpReverseTunnel",
                 "CommandResult",
                 "CommandInfo",
@@ -63,6 +93,24 @@ assert 'YR_HTTP_CONNECTION_NUM' not in os.environ
                 "PtySession",
                 "PtyError",
                 "resources",
+                "get_backend",
+                "InvalidBackendError",
+                "BackendNotInstalledError",
+                "UnsupportedBackendFeatureError",
+                "BackendOperationError",
+                "DockerContext",
+                "DockerfileLaunch",
+                "DockerContextEntry",
+                "LocalDockerContext",
+                "parse_dockerfile",
+                "check_direct_launch",
+                "apply_dockerfile",
+                "ParsedDockerfile",
+                "DockerfileApplyResult",
+                "DockerfileCheckResult",
+                "DockerfileBuildError",
+                "DockerfileParseError",
+                "BuildInstruction",
             },
         )
         for removed in (
@@ -75,6 +123,12 @@ assert 'YR_HTTP_CONNECTION_NUM' not in os.environ
             "Shell",
         ):
             self.assertFalse(hasattr(akernel_sdk, removed), removed)
+
+    def test_docker_context_entry_is_public_and_immutable(self):
+        entry = DockerContextEntry("empty", "directory", 0o755)
+        self.assertEqual(entry.path, "empty")
+        with self.assertRaisesRegex(AttributeError, "cannot assign"):
+            entry.mode = 0o700  # type: ignore[misc]
 
     def test_s3_config_serialization(self):
         config = S3Config(

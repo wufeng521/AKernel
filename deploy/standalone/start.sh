@@ -20,6 +20,10 @@ IMAGE="${IMAGE:-akerneldev/all-in-one:latest}"
 TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:v3.6.8}"
 IAM_SEED_FILE="${DATA_DIR}/iam-seed"
 TOKEN_FILE="${DATA_DIR}/token"
+SANDBOXD_CONFIG_FILE="${DATA_DIR}/sandboxd/config.toml"
+AKERNEL_NAT_BACKEND="${AKERNEL_NAT_BACKEND:-iptables}"
+AKERNEL_ENABLE_RUNC="${AKERNEL_ENABLE_RUNC:-false}"
+YR_IMAGE_PROCESS_CONFIG="${YR_IMAGE_PROCESS_CONFIG:-/run/akernel/yr-image-process.json}"
 LITEBUS_DATA_KEY=""
 
 # Container runtime command (docker or pouch)
@@ -77,9 +81,9 @@ check_prerequisites() {
     log_info "${DOCKER_CMD} is available"
 
     if [[ ! -c /dev/kvm ]]; then
-        log_warn "/dev/kvm is unavailable; standalone will support runsc but will not advertise the Kata runtime"
+        log_warn "/dev/kvm is unavailable; standalone will support runsc but will not advertise Kata or Firecracker"
     elif [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
-        log_warn "/dev/kvm is not accessible to the current user; verify that the privileged node container can access it before using Kata"
+        log_warn "/dev/kvm is not accessible to the current user; verify that the privileged node container can access it before using Kata or Firecracker"
     fi
 
     if ! command -v curl &> /dev/null; then
@@ -91,6 +95,15 @@ check_prerequisites() {
         log_error "python3 is required to generate standalone credentials"
         exit 1
     fi
+
+    case "${AKERNEL_ENABLE_RUNC}" in
+        true|false)
+            ;;
+        *)
+            log_error "AKERNEL_ENABLE_RUNC must be true or false"
+            exit 1
+            ;;
+    esac
 
     # Create data directory
     mkdir -p "${DATA_DIR}"
@@ -224,18 +237,135 @@ configure_gpu() {
     log_info "Enabling NVIDIA GPU access for the AKernel node container"
 }
 
+configure_network() {
+    local config_tmp="${SANDBOXD_CONFIG_FILE}.tmp"
+    local sed_args=(
+        -E
+        -e "s/^[[:space:]]*nat_backend[[:space:]]*=.*/nat_backend=\"${AKERNEL_NAT_BACKEND}\"/"
+    )
+
+    case "${AKERNEL_NAT_BACKEND}" in
+        iptables|bpfnat)
+            ;;
+        *)
+            log_error "AKERNEL_NAT_BACKEND must be 'iptables' or 'bpfnat'"
+            exit 1
+            ;;
+    esac
+
+    if ! grep -q '^[[:space:]]*nat_backend[[:space:]]*=' \
+        "${CONFIG_DIR}/sandboxd_config.toml"; then
+        log_error "Missing nat_backend in ${CONFIG_DIR}/sandboxd_config.toml"
+        exit 1
+    fi
+    if [[ "${AKERNEL_ENABLE_RUNC}" == "true" ]]; then
+        if ! grep -q '^[[:space:]]*# AKERNEL_RUNTIME_RUNC[[:space:]]*$' \
+            "${CONFIG_DIR}/sandboxd_config.toml"; then
+            log_error "AKERNEL_ENABLE_RUNC requires the # AKERNEL_RUNTIME_RUNC marker in sandboxd_config.toml"
+            exit 1
+        fi
+        sed_args+=(
+            -e 's|^[[:space:]]*# AKERNEL_RUNTIME_RUNC[[:space:]]*$|runc="/usr/local/bin/runc"|'
+        )
+    fi
+    sed "${sed_args[@]}" "${CONFIG_DIR}/sandboxd_config.toml" > "${config_tmp}"
+    mv "${config_tmp}" "${SANDBOXD_CONFIG_FILE}"
+
+    if [[ "${AKERNEL_ENABLE_RUNC}" == "true" ]]; then
+        log_info "Enabling the optional runc sandbox runtime"
+    fi
+
+    if [[ "${AKERNEL_NAT_BACKEND}" == "bpfnat" ]]; then
+        log_warn "Using the experimental bpfnat network backend"
+    else
+        log_info "Using the iptables network backend"
+    fi
+}
+
+prepare_host_network_modules() {
+    local modprobe_bin
+    modprobe_bin="$(command -v modprobe || true)"
+    if [[ -z "${modprobe_bin}" ]]; then
+        log_error "modprobe is required to load AKernel host network modules"
+        exit 1
+    fi
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        "${modprobe_bin}" tun
+    elif sudo -n "${modprobe_bin}" tun; then
+        :
+    else
+        log_error "Unable to load tun; run this script as root or allow passwordless sudo for modprobe"
+        exit 1
+    fi
+    if [[ ! -c /dev/net/tun ]]; then
+        log_error "tun loaded but /dev/net/tun is unavailable"
+        exit 1
+    fi
+    log_info "Loaded host tun module for pooled TAP networking"
+
+    if [[ "${AKERNEL_NAT_BACKEND}" != "iptables" ]]; then
+        return 0
+    fi
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        "${modprobe_bin}" ip_tables
+        "${modprobe_bin}" iptable_filter
+        "${modprobe_bin}" ip6_tables
+        "${modprobe_bin}" ip6table_filter
+        "${modprobe_bin}" br_netfilter
+        "${modprobe_bin}" xt_physdev
+        "${modprobe_bin}" nf_conntrack
+        "${modprobe_bin}" nf_conntrack_netlink
+        "${modprobe_bin}" xt_conntrack
+        "${modprobe_bin}" xt_connmark
+        "${modprobe_bin}" ip_set
+        "${modprobe_bin}" ip_set_hash_ip
+        "${modprobe_bin}" xt_set
+    elif sudo -n "${modprobe_bin}" ip_tables &&
+         sudo -n "${modprobe_bin}" iptable_filter &&
+         sudo -n "${modprobe_bin}" ip6_tables &&
+         sudo -n "${modprobe_bin}" ip6table_filter &&
+         sudo -n "${modprobe_bin}" br_netfilter &&
+         sudo -n "${modprobe_bin}" xt_physdev &&
+         sudo -n "${modprobe_bin}" nf_conntrack &&
+         sudo -n "${modprobe_bin}" nf_conntrack_netlink &&
+         sudo -n "${modprobe_bin}" xt_conntrack &&
+         sudo -n "${modprobe_bin}" xt_connmark &&
+         sudo -n "${modprobe_bin}" ip_set &&
+         sudo -n "${modprobe_bin}" ip_set_hash_ip &&
+         sudo -n "${modprobe_bin}" xt_set; then
+        :
+    else
+        log_error "Unable to load required iptables ACL modules; run this script as root or allow passwordless sudo for modprobe"
+        exit 1
+    fi
+
+    if [[ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ||
+          ! -e /proc/sys/net/bridge/bridge-nf-call-ip6tables ]]; then
+        log_error "br_netfilter loaded but bridge netfilter sysctls are unavailable"
+        exit 1
+    fi
+    log_info "Loaded host filter, bridge, conntrack, and ipset modules for the iptables ACL backend"
+}
+
 # Start the AKernel all-in-one container. Traefik runs separately so traffic
 # from the gateway enters this network namespace through PREROUTING.
 start_node_container() {
     log_info "Starting container: ${NODE_CONTAINER_NAME}"
+    # FunctionMaster's HTTP provider publishes the per-sandbox routes required
+    # by reverse tunnels; the legacy etcd mode cannot publish those routes.
 
     "${DOCKER_PREFIX[@]}" ${DOCKER_CMD} run -d \
         --name "${NODE_CONTAINER_NAME}" \
         --privileged \
         --net bridge \
         --restart always \
+        -e container=oci \
         -e AKS_LOCAL_MODE="true" \
-        -e TRAEFIK_MODE="etcd" \
+        -e YR_RRT_CONTROL_SOCKET_PATH="/run/akernel" \
+        -e YR_IMAGE_PROCESS_CONFIG="${YR_IMAGE_PROCESS_CONFIG}" \
+        -e TRAEFIK_MODE="http" \
         -e TRAEFIK_HTTP_ENTRYPOINT="web" \
         -e TRAEFIK_ENABLE_TLS="false" \
         -e ETCD_PORT="${ETCD_PORT}" \
@@ -255,7 +385,7 @@ start_node_container() {
         -v "${CONFIG_DIR}/registry_auths.json:/home/akernel/sandboxd/config/registry_auths.json:ro" \
         -v "${CONFIG_DIR}/registry.json:/home/akernel/sandboxd/config/registry.json:ro" \
         -v "${CONFIG_DIR}/config.json:/home/akernel/images/config.json:ro" \
-        -v "${CONFIG_DIR}/sandboxd_config.toml:/home/akernel/sandboxd/config.toml:ro" \
+        -v "${SANDBOXD_CONFIG_FILE}:/home/akernel/sandboxd/config.toml:ro" \
         "${IMAGE}"
 }
 
@@ -300,6 +430,13 @@ http:
       rule: "PathPrefix(\`/terminal\`) || PathPrefix(\`/api/instances\`) || PathPrefix(\`/api/jobs\`) || PathPrefix(\`/functions\`) || PathPrefix(\`/api-docs\`) || PathPrefix(\`/admin/v1/functions\`) || PathPrefix(\`/serverless/v1/functions\`) || PathPrefix(\`/serverless/v1/stream\`) || PathPrefix(\`/serverless/v1/componentshealth\`) || PathPrefix(\`/serverless/v1/posix\`) || PathPrefix(\`/serverless/v2\`) || PathPrefix(\`/frontend/v1/instance\`) || PathPrefix(\`/datasystem/v1\`) || PathPrefix(\`/app/v1\`) || PathPrefix(\`/client/v1/lease\`) || PathPrefix(\`/invocations\`) || PathPrefix(\`/global-scheduler\`) || Path(\`/healthz\`)"
       service: akernel-frontend
       tls: {}
+    sandbox-router:
+      entryPoints:
+        - websecure
+      rule: "PathPrefix(\`/api/sandbox\`) || PathPrefix(\`/direct/\`) || Path(\`/direct\`)"
+      priority: 100
+      service: akernel-frontend
+      tls: {}
 
   services:
     akernel-frontend:
@@ -316,7 +453,7 @@ EOF
 }
 
 start_traefik_container() {
-    local etcd_endpoint="$1"
+    local provider_endpoint="$1"
     local dynamic_config="${DATA_DIR}/traefik/dynamic.yml"
 
     log_info "Starting container: ${TRAEFIK_CONTAINER_NAME}"
@@ -329,8 +466,8 @@ start_traefik_container() {
         --entryPoints.web.address=:80 \
         --entryPoints.websecure.address=:443 \
         --providers.file.filename=/etc/traefik/dynamic.yml \
-        --providers.etcd.endpoints="${etcd_endpoint}" \
-        --providers.etcd.rootKey=traefik \
+        --providers.http.endpoint="${provider_endpoint}" \
+        --providers.http.pollInterval=1s \
         --log.level=INFO \
         --accessLog=true \
         --accessLog.format=json \
@@ -394,6 +531,8 @@ ensure_image "${IMAGE}"
 ensure_image "${TRAEFIK_IMAGE}"
 configure_container_proxy
 configure_gpu
+configure_network
+prepare_host_network_modules
 start_node_container
 wait_for_ready
 NODE_IP="$(container_ip "${NODE_CONTAINER_NAME}")"
@@ -402,9 +541,9 @@ if [[ -z "${NODE_IP}" ]]; then
     exit 1
 fi
 write_traefik_config "${NODE_IP}"
-ETCD_ENDPOINT="${NODE_IP}:${ETCD_PORT}"
-log_info "Using embedded etcd endpoint: ${ETCD_ENDPOINT}"
-start_traefik_container "${ETCD_ENDPOINT}"
+TRAEFIK_PROVIDER_ENDPOINT="http://${NODE_IP}:22770/global-scheduler/traefik/config"
+log_info "Using FunctionMaster route provider: ${TRAEFIK_PROVIDER_ENDPOINT}"
+start_traefik_container "${TRAEFIK_PROVIDER_ENDPOINT}"
 TRAEFIK_IP="$(container_ip "${TRAEFIK_CONTAINER_NAME}")"
 if [[ -z "${TRAEFIK_IP}" ]]; then
     log_error "Could not determine the Traefik container IP"

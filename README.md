@@ -33,8 +33,12 @@ One all-in-one image, multiple deployment targets — deploy in under 10 minutes
 ### Secure Isolation with Extreme Performance
 
 - **40 ms cold start\***: Fork-based launch with lazy loading for near-zero startup latency
-- **Sandbox isolation**: [gVisor](https://github.com/google/gvisor) by default, with [Kata Containers](https://github.com/kata-containers/kata-containers) available on KVM-capable nodes
-- **Checkpoint/Restore\***: Save and restore sandbox state for fast recovery
+- **Sandbox isolation**: [gVisor](https://github.com/google/gvisor) by
+  default, with [Kata Containers](https://github.com/kata-containers/kata-containers)
+  and [Firecracker](https://github.com/firecracker-microvm/firecracker)
+  available on KVM-capable nodes
+- **Same-node recovery**: Checkpoint runsc and Firecracker workloads and reload
+  the same logical sandbox
 
 \* Planned for an open-source release and not available in AKernel v0.1.0.
 
@@ -105,7 +109,8 @@ See the [Deployment Guide](./deploy/README.md) for prerequisites, cloud-specific
 
 ### Create a Sandbox
 
-Install the Python SDK from PyPI or source:
+Install the Python SDK. The default installation includes the
+`openyuanrong-sandbox` backend:
 
 ```bash
 # PyPI
@@ -113,7 +118,31 @@ python -m pip install akernel-sdk
 
 # Source
 python -m pip install ./sdk/python
+
+# Also install the deprecated actor compatibility backend
+python -m pip install "akernel-sdk[openyuanrong-sdk]"
 ```
+
+The actor-based `openyuanrong-sdk` backend is deprecated and retained only for
+compatibility with existing applications. New applications should use the
+default `openyuanrong-sandbox` backend. When the actor extra is installed,
+both backend packages are present and `openyuanrong-sandbox` remains the
+automatic default. Set
+`AKERNEL_BACKEND=openyuanrong-sdk` before importing `akernel_sdk` to select
+the actor backend:
+
+```bash
+export AKERNEL_BACKEND=openyuanrong-sdk
+```
+
+When `openyuanrong-sdk` is used from a YuanRong function, the SDK process
+inherits runtime paths configured by `builder/scripts/entryfile.sh`. That
+entrypoint exports `PYTHONPATH` and, in some runtime layouts,
+`LD_LIBRARY_PATH`; both variables are inherited by the application and its
+child processes. `PYTHONPATH` prepends the runtime site-packages directory and
+can change import resolution or shadow application dependencies.
+`LD_LIBRARY_PATH` prepends runtime library directories and can change native
+library resolution, causing ABI or version conflicts.
 
 Configure the AKernel environment:
 
@@ -135,17 +164,16 @@ with Sandbox(cpu=1000, memory=2048) as sandbox:
     print(sandbox.files.read("/tmp/hello.txt"))
 ```
 
-Experimental gVisor sandboxes can request an exact NVIDIA GPU model and a
-disk-backed writable root filesystem quota:
+Experimental gVisor sandboxes can request an exact NVIDIA GPU model:
 
 ```python
-with Sandbox(xpu="gpu:l20:1", storage_mb=20 * 1024) as sandbox:
+with Sandbox(xpu="gpu:l20:1") as sandbox:
     print(sandbox.commands.run("nvidia-smi -L").stdout)
 ```
 
-GPU sandboxes require a compatible NVIDIA node and currently support only the
-gVisor `runsc` runtime. `storage_mb` is measured in MiB and also currently
-requires `runsc`.
+GPU sandboxes require a compatible NVIDIA node and the gVisor `runsc`
+runtime. `storage_mb` is measured in MiB and is supported by `runsc` and
+Firecracker.
 
 See the complete [basic usage example](./sdk/python/examples/basic_usage.py), the [sandbox runtime example](./sdk/python/examples/sandbox_runtime.py), and the other [SDK examples](./sdk/python/examples/) for more operations.
 
@@ -156,10 +184,10 @@ See the complete [basic usage example](./sdk/python/examples/basic_usage.py), th
 ### System Components
 
 **Node-Level Infrastructure**
-- **Sandbox runtimes**: gVisor by default, including experimental NVIDIA GPU
-  and writable-storage support, and Kata Containers on KVM-capable nodes
+- **Sandbox runtimes**: gVisor by default; Kata Containers and Firecracker on
+  KVM-capable nodes; and an explicitly enabled native Linux runc backend
 - **sandboxd**: Sandbox lifecycle daemon with pluggable sandbox runtime integration
-- **distill-fs**: Rust-based FUSE filesystem for lazy rootfs access, chunk caching, and deduplication
+- **distill-fs**: Rust-based FUSE filesystem for lazy rootfs access, chunk caching, and deduplication; packaged from a static GitHub Release with its version and checksum pinned in AKernel
 
 **Cluster-Wide Services**
 - **Distributed Scheduler**: Workload-aware placement and scaling
@@ -179,8 +207,11 @@ See the complete [basic usage example](./sdk/python/examples/basic_usage.py), th
 ## Roadmap
 
 - [x] Kata Containers runtime on KVM-capable nodes
+- [x] Firecracker microVM runtime on KVM-capable nodes
+- [x] Optional native Linux runc runtime
+- [x] Stateful sandbox network ACLs for CIDRs, domains, protocols, and ports
 - [ ] Fork-based sandbox launch based on gVisor
-- [ ] Sandbox checkpoint and restore
+- [x] Same-node checkpoint recovery for runsc and Firecracker
 - [ ] Support for GKE and AWS
 - [x] Cgroup v2 node support
 

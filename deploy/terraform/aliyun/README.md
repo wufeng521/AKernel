@@ -10,6 +10,25 @@ It installs:
 - Optional Dragonfly to `dragonfly_namespace` (controlled by `install_dragonfly`)
 - Optional prereq `openkruise` to `prereq_namespace` (controlled by `install_prereqs`)
 
+## Pod PID budget
+
+`node_pool_pids_limit` defaults to `1620780` for the default pool and all
+user-supplied `extra_node_pools`; generated Dragonfly pools are excluded.
+Override it in `terraform.tfvars` with a positive integer or `-1` (node
+allocatable PID capacity). All sandboxes and runtime services share this
+budget; the per-sandbox limit stays 4096. Size it for node capacity and monitor
+memory pressure. Existing clusters require separate kubelet configuration.
+Review rollout impact before applying, then verify actual Pod and ancestor
+`pids.max` values: a kubelet config update alone may leave existing Pods stale.
+
+The default AKernel node pool also sets host `kernel.pid_max=4194304`, raises
+`kernel.threads-max` to at least `4194304`, and removes implicit systemd limits
+on container scopes. Settings persist through ACK's customized sysctl file
+and systemd drop-ins; Pod and sandbox limits remain in force. Extra and
+Dragonfly pools are unchanged. Existing hosts need a separately reviewed
+migration, including kubelet restart if its node-wide PID capacity is stale;
+changing user data only updates future nodes. Verify every Pod ancestor limit.
+
 ## Prerequisites
 - Terraform >= 1.5
 - Alibaba Cloud account permissions for VPC/VSwitch/ACK/RAM resources
@@ -110,6 +129,45 @@ terraform apply \
   -var 'install_monitor=true' \
   -var 'grafana_public_access=true' \
   -var 'monitor_storage_class=alicloud-disk-essd'
+```
+
+## AKernel node storage
+
+New Terraform-managed ACK node pools attach two data disks by default. The
+first remains available to ACK for the container runtime. The second is a
+dedicated 300 GiB ESSD that ACK formats as XFS and mounts at
+`/home/akernel` before the node joins the cluster. The same storage layout is
+applied to user-defined `extra_node_pools`; dedicated Dragonfly pools retain
+their own storage configuration.
+
+AKernel stores both `/home/akernel/filestore` and
+`/home/akernel/checkpoints` on that native XFS filesystem. The generated
+sandboxd configuration intentionally leaves `filestore_dir_size` unset, so
+sandboxd uses the directory directly instead of creating a loop-backed ext4
+or XFS filesystem. Keeping the writable layer and checkpoint artifacts on
+the same reflink-capable filesystem enables the fast Firecracker checkpoint
+and restore path.
+
+Change the dedicated disk capacity or category with
+`node_pool_extra_data_disk_size` and
+`node_pool_extra_data_disk_category`. Set
+`node_pool_extra_data_disk_enabled=false` to opt out, for example when an
+existing cluster already provisions `/home/akernel` itself. The option has no
+effect when `create_cluster=false`; existing-cluster users must mount a
+suitable host filesystem before deploying the chart. An explicit ext4
+override remains supported for compatibility, but it cannot provide the XFS
+reflink checkpoint path.
+
+Changing these settings does not migrate live sandbox data on existing
+nodes. Before replacing an existing node pool, drain its sandboxes and remove
+or relocate lifecycle-bound checkpoints. Review the Terraform plan as the
+default dedicated disk adds one cloud disk per AKernel node.
+
+After provisioning a node, verify the effective layout with:
+
+```bash
+findmnt -no SOURCE,FSTYPE,TARGET /home/akernel
+xfs_info /home/akernel | grep 'reflink=1'
 ```
 
 Install Dragonfly P2P distribution:
